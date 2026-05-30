@@ -1,0 +1,63 @@
+name: repo-check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  syntax-and-artifact-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python sources
+        run: |
+          python - <<'PY'
+          import compileall
+          import pathlib
+          import sys
+
+          paths = [path for path in ("scripts", "src", "cog_diffuser/diffusers/src/diffusers") if pathlib.Path(path).exists()]
+          if not paths:
+              print("No source directories found.")
+              sys.exit(1)
+
+          ok = all(compileall.compile_dir(path, quiet=1) for path in paths)
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Guard against accidental large artifacts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          forbidden_exts = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".mp4", ".mov", ".avi"}
+          size_limit = 25 * 1024 * 1024
+
+          result = subprocess.run(["git", "ls-files"], check=True, text=True, capture_output=True)
+          tracked = [Path(line) for line in result.stdout.splitlines() if line.strip()]
+
+          violations = []
+          for path in tracked:
+              if not path.is_file():
+                  continue
+              if path.suffix.lower() in forbidden_exts:
+                  violations.append(f"forbidden artifact type: {path}")
+              elif path.stat().st_size > size_limit:
+                  violations.append(f"file larger than 25 MiB: {path}")
+
+          if violations:
+              print("\n".join(violations))
+              sys.exit(1)
+          PY

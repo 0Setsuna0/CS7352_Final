@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+.cache/
+outputs/
+artifacts/
+logs/
+
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+.env
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Vendored CogVideoX runtime source tracked in this repository.
+# Do not create a nested git repository under cog_diffuser/diffusers.
+cog_diffuser/diffusers/.git/
