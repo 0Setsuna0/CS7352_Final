@@ -61,7 +61,13 @@ This repository now uses a single-repository workflow. The local `diffusers` sou
 cog_diffuser\diffusers
 ```
 
-After pulling new source changes from this repository, reinstall the editable package if needed:
+Because `cog_diffuser/diffusers` is installed in editable mode, ordinary Python source changes under that directory take effect immediately after `git pull`.
+
+Rerun `setup_env.ps1` only when one of these is true:
+
+- `.venv` does not exist or is broken
+- `requirements.txt` changed
+- packaging metadata under `cog_diffuser/diffusers` changed and you want to refresh the local install
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1

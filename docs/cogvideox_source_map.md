@@ -43,7 +43,9 @@ Typical split of responsibilities:
 
 ## Make Sure Local Edits Are Active
 
-After pulling `cog_diffuser/diffusers`, install it in editable mode:
+After the first environment setup, ordinary Python source changes under `cog_diffuser/diffusers` take effect immediately because the package is installed in editable mode.
+
+Rerun environment setup only if `.venv` is missing or broken, `requirements.txt` changed, or package metadata changed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1

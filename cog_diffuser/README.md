@@ -8,11 +8,9 @@ The runtime source used by the current CogVideoX baseline lives here:
 cog_diffuser\diffusers
 ```
 
-After pulling changes, reinstall the editable package if needed:
+Because this source tree is installed in editable mode, ordinary Python source changes take effect immediately after `git pull`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1
-```
+Rerun `scripts/setup_env.ps1` only when `.venv` is missing or broken, `requirements.txt` changed, or packaging metadata under `cog_diffuser/diffusers` changed.
 
 Current vendored source:
 
@@ -21,6 +19,6 @@ Current vendored source:
 Important:
 
 - The current baseline in this project imports `diffusers.CogVideoXPipeline`, so edits under `cog_diffuser/diffusers` are what affect runtime first.
-- After pulling source changes, rerun `scripts/setup_env.ps1` or manually install it editable so Python uses the vendored package in `.venv\Lib\site-packages`.
+- After pulling ordinary source changes, no reinstall is needed. Rerun `scripts/setup_env.ps1` only if the environment or package metadata changed.
 
 Do not commit downloaded model weights, generated videos, or Hugging Face cache files into this repository.
