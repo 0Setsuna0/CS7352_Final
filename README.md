@@ -1,6 +1,15 @@
-# CogVideoX Course Project
+# CS7352 Course Project
 
-This workspace is set up for a `CogVideoX-2B` baseline on a `12 GB` NVIDIA GPU.
+This workspace is set up for `CogVideoX-2B` inference and source-level experimentation on a single NVIDIA GPU.
+
+## Prerequisites
+
+- Windows with PowerShell
+- `git`
+- `uv` available on `PATH`
+- An NVIDIA GPU with a working driver
+
+`setup_env.ps1` uses `uv` to create `.venv`, provision `Python 3.12`, install CUDA-enabled PyTorch, install project requirements, and install the vendored `cog_diffuser/diffusers` source in editable mode.
 
 ## Quick Start
 
@@ -12,10 +21,24 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup_env.ps1
 
 .\.venv\Scripts\Activate.ps1
 python .\scripts\check_env.py
-python .\scripts\run_baseline_smoke_test.py --download-workers 1
+python .\scripts\run_baseline_smoke_test.py --preset smoke --download-workers 1
 ```
 
-The setup script creates a local virtual environment with `Python 3.12`, installs a CUDA-enabled PyTorch build, and installs the dependencies used for `diffusers`-based CogVideoX inference.
+The first smoke-test run downloads the `THUDM/CogVideoX-2b` weights from the Hugging Face Hub and can take several minutes.
+
+After the first successful run, you can rerun the quick smoke test without network access:
+
+```powershell
+python .\scripts\run_baseline_smoke_test.py --preset smoke --local-files-only
+```
+
+To generate a better-looking baseline video after the cache is ready:
+
+```powershell
+python .\scripts\run_baseline_smoke_test.py --preset quality --local-files-only
+```
+
+`python .\scripts\check_env.py` should report a `diffusers path` inside `cog_diffuser\diffusers` and `diffusers editable checkout active: True`.
 
 ## Source Layout
 
