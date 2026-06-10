@@ -22,11 +22,11 @@ from huggingface_hub import snapshot_download
 
 
 # The only user-facing switch: True enables TokenMerge, False runs without it.
-ENABLE_TOKEN_MERGE = True
+ENABLE_TOKEN_MERGE = False
 
 
 _MODEL_ID = "THUDM/CogVideoX-2b"
-_TOKEN_MERGE_CONFIG = "configs/merge/block_adaptive_r20.json"
+_TOKEN_MERGE_CONFIG = "configs/merge/kv_spatial_r20_mid.json"
 _SEED = 123
 _HEIGHT = 480
 _WIDTH = 720
@@ -244,6 +244,7 @@ def write_metadata(
         "merge_mode": merge_cfg.mode if merge_cfg else None,
         "rope_mode": merge_cfg.rope_mode if merge_cfg else None,
         "prop_attn": merge_cfg.prop_attn if merge_cfg else None,
+        "partition": merge_cfg.partition if merge_cfg else None,
         "peak_gpu_memory_gib": None if peak_gpu_memory_gib() is None else round(peak_gpu_memory_gib(), 3),
         "output_path": str(path.resolve()),
     }
@@ -302,6 +303,7 @@ def main() -> int:
     if merge_cfg:
         print(f"  merge_config={(repo_root() / _TOKEN_MERGE_CONFIG).resolve()}")
         print(f"  merge_scope={merge_cfg.scope}, ratio={merge_cfg.ratio}, mode={merge_cfg.mode}")
+        print(f"  partition={merge_cfg.partition}")
         print(f"  merge_layers={merge_cfg.layers}")
 
     generator = torch.Generator().manual_seed(_SEED)

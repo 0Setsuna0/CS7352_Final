@@ -16,7 +16,7 @@ class MergeConfig:
     enabled: bool = False
     ratio: float = 0.0
     mode: str = "spatial"               # "spatial" | "spatiotemporal"
-    scope: str = "block"                # "block" | "attn_only" | "pre_attn_restore"
+    scope: str = "block"                # "block" | "kv_only" | "attn_only" | "pre_attn_restore"
     rope_mode: str = "pre_rope"         # "pre_rope" | "dst"
     prop_attn: bool = True              # log(size) bias in softmax
     match_feature: str = "hidden_norm"  # "hidden_norm" | "attn_k"
@@ -24,6 +24,7 @@ class MergeConfig:
     temporal_window: int = 1
     protect_first_frame: bool = True    # latent frame 0
     skip_early_ratio: float = 0.0       # skip merging for the first X% of timesteps (0-1)
+    partition: str = "checkerboard"     # "checkerboard" | "checkerboard_shifted"
 
 
 @dataclass
@@ -42,14 +43,28 @@ _fixed_match_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 def _build_spatial_partition(
-    n_video: int, frames: int, gh: int, gw: int
+    n_video: int,
+    frames: int,
+    gh: int,
+    gw: int,
+    partition: str = "checkerboard",
+    partition_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split video tokens into two disjoint sets (src, dst) for bipartite matching.
 
     For spatial mode we use a checkerboard on the (h, w) grid within each frame
-    so that roughly half the tokens are in each set. Results are cached.
+    so that roughly half the tokens are in each set. ``checkerboard_shifted``
+    flips the source/destination color by offset, reducing fixed grid artifacts
+    when different transformer layers use alternating offsets.
     """
-    key = (n_video, frames, gh, gw)
+    if partition == "checkerboard":
+        offset = 0
+    elif partition == "checkerboard_shifted":
+        offset = partition_offset % 2
+    else:
+        raise ValueError(f"Unknown partition: {partition!r}")
+
+    key = (n_video, frames, gh, gw, partition, offset)
     if key in _partition_cache:
         return _partition_cache[key]
 
@@ -57,7 +72,7 @@ def _build_spatial_partition(
     hw = idx % (gh * gw)
     h = hw // gw
     w = hw % gw
-    is_src = ((h + w) % 2 == 0)
+    is_src = ((h + w + offset) % 2 == 0)
     result = (is_src, ~is_src)
     _partition_cache[key] = result
     return result
@@ -91,6 +106,8 @@ def bipartite_soft_match(
     temporal_window: int = 1,
     protect_first_frame: bool = True,
     match_feature: str = "hidden_norm",
+    partition: str = "checkerboard",
+    partition_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bipartite soft matching on L2-normalised token features.
 
@@ -101,6 +118,8 @@ def bipartite_soft_match(
         mode: "spatial" or "spatiotemporal".
         temporal_window: for spatiotemporal, frame distance for cross-frame matching.
         protect_first_frame: never absorb tokens from latent frame 0.
+        partition: source/destination partition strategy.
+        partition_offset: parity offset for shifted partition strategies.
 
     Returns:
         src_idx:  [B, r]    — absorbed token indices (into original N).
@@ -118,12 +137,29 @@ def bipartite_soft_match(
         dst_idx = torch.empty(B, 0, dtype=torch.long, device=metric.device)
         return src_idx, dst_idx, keep_idx, sizes
 
-    _idx_key = (N, frames, gh, gw, mode, protect_first_frame, str(metric.device))
+    _idx_key = (
+        N,
+        frames,
+        gh,
+        gw,
+        mode,
+        protect_first_frame,
+        partition,
+        partition_offset % 2,
+        str(metric.device),
+    )
     if _idx_key in _indices_cache:
         src_indices, dst_indices = _indices_cache[_idx_key]
     else:
         if mode in ("spatial", "spatiotemporal"):
-            is_src, is_dst = _build_spatial_partition(N, frames, gh, gw)
+            is_src, is_dst = _build_spatial_partition(
+                N,
+                frames,
+                gh,
+                gw,
+                partition=partition,
+                partition_offset=partition_offset,
+            )
             is_src = is_src.to(metric.device)
             is_dst = is_dst.to(metric.device)
         else:
@@ -151,7 +187,19 @@ def bipartite_soft_match(
     if match_feature == "fixed":
         # Fixed positional merge: pair each src with its nearest dst neighbor.
         # Fully deterministic, no similarity computation, batch-independent.
-        _fixed_key = (N, frames, gh, gw, mode, protect_first_frame, r, str(metric.device))
+        _fixed_key = (
+            N,
+            frames,
+            gh,
+            gw,
+            mode,
+            temporal_window,
+            protect_first_frame,
+            r,
+            partition,
+            partition_offset % 2,
+            str(metric.device),
+        )
         if _fixed_key in _fixed_match_cache:
             batch_src_idx, batch_dst_idx, keep_idx = _fixed_match_cache[_fixed_key]
             batch_src_idx = batch_src_idx.expand(B, -1)
@@ -321,6 +369,27 @@ def unmerge_tokens(
     full_x.scatter_(1, info.src_idx.unsqueeze(-1).expand(-1, -1, C), dst_values)
 
     return full_x
+
+
+def merge_kv_tokens(
+    x: torch.Tensor,
+    info: RestoreInfo,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge token axis for attention K/V tensors.
+
+    Args:
+        x: [B, H, N, D] video key/value tokens.
+        info: RestoreInfo over the N video-token positions.
+
+    Returns:
+        merged: [B, H, N-r, D]
+        new_sizes: [B, N-r]
+    """
+    B, H, N, D = x.shape
+    flat = x.transpose(1, 2).reshape(B, N, H * D)
+    merged_flat, new_sizes = merge_tokens(flat, info)
+    merged = merged_flat.reshape(B, -1, H, D).transpose(1, 2).contiguous()
+    return merged, new_sizes
 
 
 def size_log_bias(

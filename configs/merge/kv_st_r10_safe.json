@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "ratio": 0.1,
+  "mode": "spatiotemporal",
+  "scope": "kv_only",
+  "rope_mode": "pre_rope",
+  "prop_attn": true,
+  "match_feature": "hidden_norm",
+  "layers": "middle",
+  "temporal_window": 1,
+  "protect_first_frame": true,
+  "skip_early_ratio": 0.4,
+  "partition": "checkerboard_shifted"
+}

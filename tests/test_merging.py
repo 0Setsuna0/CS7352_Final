@@ -13,6 +13,7 @@ from tokmerge.merging import (
     MergeConfig,
     RestoreInfo,
     bipartite_soft_match,
+    merge_kv_tokens,
     merge_tokens,
     unmerge_tokens,
     size_log_bias,
@@ -387,3 +388,61 @@ class TestEdgeCases:
         )
         assert merged.shape == x.shape
         assert torch.allclose(merged, x)
+
+
+# ===========================================================================
+# 10. KV-only helpers
+# ===========================================================================
+
+class TestKVOnlyHelpers:
+    def test_merge_kv_tokens_preserves_head_layout(self):
+        frames, gh, gw = 2, 4, 4
+        B, H, D = 2, 3, 5
+        N = frames * gh * gw
+        r = 6
+        metric = _make_metric(B, frames, gh, gw, C=16, seed=11)
+        src_idx, dst_idx, keep_idx, sizes = bipartite_soft_match(
+            metric,
+            r=r,
+            frames=frames,
+            gh=gh,
+            gw=gw,
+            protect_first_frame=False,
+        )
+        info = RestoreInfo(src_idx, dst_idx, keep_idx, sizes, N, (frames, gh, gw))
+        kv = torch.randn(B, H, N, D)
+
+        merged, new_sizes = merge_kv_tokens(kv, info)
+
+        assert merged.shape == (B, H, N - r, D)
+        assert new_sizes.shape == (B, N - r)
+        assert torch.all(new_sizes >= 1)
+
+    def test_checkerboard_shifted_flips_source_partition(self):
+        frames, gh, gw = 2, 4, 4
+        metric = _make_metric(1, frames, gh, gw, C=8, seed=12)
+
+        src0, _, _, _ = bipartite_soft_match(
+            metric,
+            r=4,
+            frames=frames,
+            gh=gh,
+            gw=gw,
+            protect_first_frame=False,
+            match_feature="fixed",
+            partition="checkerboard_shifted",
+            partition_offset=0,
+        )
+        src1, _, _, _ = bipartite_soft_match(
+            metric,
+            r=4,
+            frames=frames,
+            gh=gh,
+            gw=gw,
+            protect_first_frame=False,
+            match_feature="fixed",
+            partition="checkerboard_shifted",
+            partition_offset=1,
+        )
+
+        assert not torch.equal(src0, src1)

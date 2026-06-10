@@ -29,6 +29,31 @@ from ..utils.torch_utils import is_torch_version, maybe_allow_in_graph
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+
+def _import_tokmerge_ops():
+    """Import local tokmerge helpers from the project src/ tree."""
+    try:
+        from tokmerge.merging import RestoreInfo, merge_kv_tokens, size_log_bias
+
+        return RestoreInfo, merge_kv_tokens, size_log_bias
+    except ModuleNotFoundError:
+        import sys
+        from pathlib import Path
+
+        current = Path(__file__).resolve()
+        for parent in current.parents:
+            candidate = parent / "src" / "tokmerge" / "merging.py"
+            if candidate.exists():
+                src_dir = str(parent / "src")
+                if src_dir not in sys.path:
+                    sys.path.insert(0, src_dir)
+                break
+
+        from tokmerge.merging import RestoreInfo, merge_kv_tokens, size_log_bias
+
+        return RestoreInfo, merge_kv_tokens, size_log_bias
+
+
 if is_torch_npu_available():
     import torch_npu
 
@@ -2325,7 +2350,14 @@ class CogVideoXAttnProcessor2_0:
         if image_rotary_emb is not None:
             from .embeddings import apply_rotary_emb
 
-            if merge_info is not None and merge_cfg is not None:
+            if merge_info is not None and merge_cfg is not None and merge_cfg.scope == "kv_only":
+                if merge_cfg.rope_mode != "pre_rope":
+                    raise ValueError("scope='kv_only' currently requires rope_mode='pre_rope'.")
+                query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
+                if not attn.is_cross_attention:
+                    key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
+
+            elif merge_info is not None and merge_cfg is not None:
                 rope_mode = merge_cfg.rope_mode
                 n_video_q = query.shape[2] - text_seq_length
                 n_video_k = key.shape[2] - text_seq_length
@@ -2370,16 +2402,34 @@ class CogVideoXAttnProcessor2_0:
                 if not attn.is_cross_attention:
                     key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
 
+        # KV-only TokenMerge: keep full-length queries/outputs, shorten video K/V.
+        kv_merge_info = merge_info
+        if merge_info is not None and merge_cfg is not None and merge_cfg.scope == "kv_only":
+            if attention_mask is not None:
+                raise ValueError("scope='kv_only' does not support attention_mask yet.")
+
+            RestoreInfo, merge_kv_tokens, _ = _import_tokmerge_ops()
+            key_text, key_video = key[:, :, :text_seq_length], key[:, :, text_seq_length:]
+            value_text, value_video = value[:, :, :text_seq_length], value[:, :, text_seq_length:]
+
+            merged_key_video, new_sizes = merge_kv_tokens(key_video, merge_info)
+            merged_value_video, _ = merge_kv_tokens(value_video, merge_info)
+            key = torch.cat([key_text, merged_key_video], dim=2)
+            value = torch.cat([value_text, merged_value_video], dim=2)
+            kv_merge_info = RestoreInfo(
+                src_idx=merge_info.src_idx,
+                dst_idx=merge_info.dst_idx,
+                keep_idx=merge_info.keep_idx,
+                sizes=new_sizes,
+                num_video_tokens=merge_info.num_video_tokens,
+                grid=merge_info.grid,
+            )
+
         # Proportional attention bias
         prop_attn_mask = attention_mask
-        if merge_info is not None and merge_cfg is not None and merge_cfg.prop_attn:
-            import sys
-            from pathlib import Path as _P
-            _sd = str(_P(__file__).resolve().parents[4] / "src")
-            if _sd not in sys.path:
-                sys.path.insert(0, _sd)
-            from tokmerge.merging import size_log_bias
-            bias = size_log_bias(merge_info, text_seq_length, attn.heads)
+        if kv_merge_info is not None and merge_cfg is not None and merge_cfg.prop_attn:
+            _, _, size_log_bias = _import_tokmerge_ops()
+            bias = size_log_bias(kv_merge_info, text_seq_length, attn.heads)
             bias = bias.to(query.dtype).to(query.device)
             if prop_attn_mask is not None:
                 prop_attn_mask = prop_attn_mask + bias

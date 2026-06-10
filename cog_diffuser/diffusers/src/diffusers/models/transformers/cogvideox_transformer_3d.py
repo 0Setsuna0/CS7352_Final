@@ -170,6 +170,8 @@ class CogVideoXBlock(nn.Module):
                 temporal_window=merge_cfg.temporal_window,
                 protect_first_frame=merge_cfg.protect_first_frame,
                 match_feature=merge_cfg.match_feature,
+                partition=getattr(merge_cfg, "partition", "checkerboard"),
+                partition_offset=getattr(self, "_block_index", 0),
             )
             info = _RestoreInfo(
                 src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
@@ -193,6 +195,23 @@ class CogVideoXBlock(nn.Module):
                     **clean_kwargs,
                 )
                 attn_hidden_states = _unmerge(attn_hidden_states, info)
+
+            elif merge_cfg.scope == "kv_only":
+                # KV-only keeps every query/output position alive and only
+                # shortens video K/V inside the attention processor.
+                processor = self.attn1.processor
+                processor._tokmerge_info = info
+                processor._tokmerge_cfg = merge_cfg
+                try:
+                    attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                        hidden_states=norm_hidden_states,
+                        encoder_hidden_states=norm_encoder_hidden_states,
+                        image_rotary_emb=image_rotary_emb,
+                        **clean_kwargs,
+                    )
+                finally:
+                    processor._tokmerge_info = None
+                    processor._tokmerge_cfg = None
 
             elif merge_cfg.scope in ("attn_only", "block"):
                 if merge_cfg.scope == "block":
