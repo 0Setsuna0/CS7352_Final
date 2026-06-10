@@ -13,10 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from pathlib import Path as _Path
 from typing import Any
 
 import torch
 from torch import nn
+
+# Ensure src/ is on the path for tokmerge imports
+_src_dir = str(_Path(__file__).resolve().parents[6] / "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
+from tokmerge.merging import (
+    bipartite_soft_match as _bsm,
+    merge_tokens as _merge,
+    unmerge_tokens as _unmerge,
+    RestoreInfo as _RestoreInfo,
+)
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
@@ -126,18 +140,100 @@ class CogVideoXBlock(nn.Module):
         text_seq_length = encoder_hidden_states.size(1)
         attention_kwargs = attention_kwargs or {}
 
+        merge_cfg = getattr(self, "_merge_cfg", None)
+        merge_active = (
+            merge_cfg is not None
+            and merge_cfg.enabled
+            and merge_cfg.ratio > 0
+            and hasattr(self, "_block_index")
+            and self._block_index in merge_cfg.layers
+            and "_tokmerge_grid" in attention_kwargs
+        )
+
         # norm & modulate
         norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
             hidden_states, encoder_hidden_states, temb
         )
 
-        # attention
-        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-            **attention_kwargs,
-        )
+        if merge_active:
+            grid_t, grid_h, grid_w = attention_kwargs["_tokmerge_grid"]
+            N_video = norm_hidden_states.shape[1]
+            r = int(N_video * merge_cfg.ratio)
+
+            if merge_cfg.match_feature == "fixed":
+                metric = norm_hidden_states[:, :, :1]
+            else:
+                metric = torch.nn.functional.normalize(norm_hidden_states, dim=-1)
+            src_idx, dst_idx, keep_idx, sizes = _bsm(
+                metric, r, grid_t, grid_h, grid_w,
+                mode=merge_cfg.mode,
+                temporal_window=merge_cfg.temporal_window,
+                protect_first_frame=merge_cfg.protect_first_frame,
+                match_feature=merge_cfg.match_feature,
+            )
+            info = _RestoreInfo(
+                src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
+                sizes=sizes, num_video_tokens=N_video,
+                grid=(grid_t, grid_h, grid_w),
+            )
+
+            clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+
+            if merge_cfg.scope == "pre_attn_restore":
+                merged_video, new_sizes = _merge(norm_hidden_states, info)
+                info = _RestoreInfo(
+                    src_idx=info.src_idx, dst_idx=info.dst_idx,
+                    keep_idx=info.keep_idx, sizes=new_sizes,
+                    num_video_tokens=N_video, grid=info.grid,
+                )
+                attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                    hidden_states=merged_video,
+                    encoder_hidden_states=norm_encoder_hidden_states,
+                    image_rotary_emb=image_rotary_emb,
+                    **clean_kwargs,
+                )
+                attn_hidden_states = _unmerge(attn_hidden_states, info)
+
+            elif merge_cfg.scope in ("attn_only", "block"):
+                if merge_cfg.scope == "block":
+                    merged_video, new_sizes = _merge(norm_hidden_states, info)
+                    info = _RestoreInfo(
+                        src_idx=info.src_idx, dst_idx=info.dst_idx,
+                        keep_idx=info.keep_idx, sizes=new_sizes,
+                        num_video_tokens=N_video, grid=info.grid,
+                    )
+                    video_for_attn = merged_video
+                else:
+                    video_for_attn = norm_hidden_states
+
+                # Set merge info on processor so it can handle RoPE + prop_attn
+                processor = self.attn1.processor
+                processor._tokmerge_info = info
+                processor._tokmerge_cfg = merge_cfg
+                try:
+                    attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                        hidden_states=video_for_attn,
+                        encoder_hidden_states=norm_encoder_hidden_states,
+                        image_rotary_emb=image_rotary_emb,
+                        **clean_kwargs,
+                    )
+                finally:
+                    processor._tokmerge_info = None
+                    processor._tokmerge_cfg = None
+
+                if merge_cfg.scope == "block":
+                    attn_hidden_states = _unmerge(attn_hidden_states, info)
+            else:
+                raise ValueError(f"Unknown merge scope: {merge_cfg.scope}")
+        else:
+            # Baseline path: unchanged; filter out tokmerge keys
+            clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+            attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+                **clean_kwargs,
+            )
 
         hidden_states = hidden_states + gate_msa * attn_hidden_states
         encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
@@ -148,11 +244,31 @@ class CogVideoXBlock(nn.Module):
         )
 
         # feed-forward
-        norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
-        ff_output = self.ff(norm_hidden_states)
-
-        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
-        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+        if merge_active and merge_cfg.scope == "block":
+            # FF merge uses fresh sizes (=1) since norm2 output is full-length,
+            # each position represents exactly 1 token regardless of prior merges.
+            B_cur = norm_hidden_states.shape[0]
+            ff_info = _RestoreInfo(
+                src_idx=info.src_idx, dst_idx=info.dst_idx,
+                keep_idx=info.keep_idx,
+                sizes=torch.ones(B_cur, info.keep_idx.shape[1],
+                                 device=norm_hidden_states.device,
+                                 dtype=norm_hidden_states.dtype),
+                num_video_tokens=info.num_video_tokens, grid=info.grid,
+            )
+            merged_norm, _ = _merge(norm_hidden_states, ff_info)
+            norm_cat = torch.cat([norm_encoder_hidden_states, merged_norm], dim=1)
+            ff_output = self.ff(norm_cat)
+            ff_text = ff_output[:, :text_seq_length]
+            ff_video_merged = ff_output[:, text_seq_length:]
+            ff_video = _unmerge(ff_video_merged, ff_info)
+            hidden_states = hidden_states + gate_ff * ff_video
+            encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_text
+        else:
+            norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+            ff_output = self.ff(norm_hidden_states)
+            hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
+            encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
 
         return hidden_states, encoder_hidden_states
 
@@ -331,6 +447,9 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
 
         self.gradient_checkpointing = False
 
+        # Token merging: set by runtime.attach_merge_config(); None = baseline
+        self._merge_cfg = None
+
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.fuse_qkv_projections with FusedAttnProcessor2_0->FusedCogVideoXAttnProcessor2_0
     def fuse_qkv_projections(self):
         """
@@ -429,6 +548,29 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
         text_seq_length = encoder_hidden_states.shape[1]
         encoder_hidden_states = hidden_states[:, :text_seq_length]
         hidden_states = hidden_states[:, text_seq_length:]
+
+        # Token merging: compute grid metadata for blocks
+        if self._merge_cfg is not None and self._merge_cfg.enabled:
+            p = self.config.patch_size
+            p_t = self.config.patch_size_t
+            grid_h = height // p
+            grid_w = width // p
+            if p_t is None:
+                grid_t = num_frames
+            else:
+                grid_t = (num_frames + p_t - 1) // p_t
+            if attention_kwargs is None:
+                attention_kwargs = {}
+
+            # Skip merging for early (noisy) timesteps to avoid structured artifacts
+            skip_early = self._merge_cfg.skip_early_ratio
+            t_val = timesteps.float().mean().item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
+            merge_disabled = skip_early > 0 and t_val > 1000.0 * (1.0 - skip_early)
+
+            if merge_disabled:
+                attention_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+            else:
+                attention_kwargs = {**attention_kwargs, "_tokmerge_grid": (grid_t, grid_h, grid_w)}
 
         # 3. Transformer blocks
         for i, block in enumerate(self.transformer_blocks):

@@ -2294,6 +2294,9 @@ class CogVideoXAttnProcessor2_0:
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.size(1)
 
+        merge_info = getattr(self, "_tokmerge_info", None)
+        merge_cfg = getattr(self, "_tokmerge_cfg", None)
+
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         batch_size, sequence_length, _ = hidden_states.shape
@@ -2318,16 +2321,73 @@ class CogVideoXAttnProcessor2_0:
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # Apply RoPE if needed
+        # Apply RoPE
         if image_rotary_emb is not None:
             from .embeddings import apply_rotary_emb
 
-            query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
-            if not attn.is_cross_attention:
-                key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
+            if merge_info is not None and merge_cfg is not None:
+                rope_mode = merge_cfg.rope_mode
+                n_video_q = query.shape[2] - text_seq_length
+                n_video_k = key.shape[2] - text_seq_length
+
+                if rope_mode in ("pre_rope", "dst"):
+                    rope_cos, rope_sin = image_rotary_emb
+                    keep_idx = merge_info.keep_idx  # [B, n_kept]
+
+                    # Check if all batch elements share the same keep_idx (fixed matching)
+                    same_idx = (keep_idx[0] == keep_idx).all() if keep_idx.shape[0] > 1 else True
+
+                    if same_idx:
+                        rope_idx = keep_idx[0]
+                        if rope_cos.dim() == 2:
+                            sel_rope = (rope_cos[rope_idx], rope_sin[rope_idx])
+                        else:
+                            sel_rope = (rope_cos[:, rope_idx], rope_sin[:, rope_idx])
+                        query[:, :, text_seq_length:] = apply_rotary_emb(
+                            query[:, :, text_seq_length:], sel_rope
+                        )
+                        if not attn.is_cross_attention:
+                            key[:, :, text_seq_length:] = apply_rotary_emb(
+                                key[:, :, text_seq_length:], sel_rope
+                            )
+                    else:
+                        # Per-batch RoPE for adaptive matching with CFG
+                        for b in range(keep_idx.shape[0]):
+                            rope_idx_b = keep_idx[b]
+                            if rope_cos.dim() == 2:
+                                sel_rope_b = (rope_cos[rope_idx_b], rope_sin[rope_idx_b])
+                            else:
+                                sel_rope_b = (rope_cos[:, rope_idx_b], rope_sin[:, rope_idx_b])
+                            query[b:b+1, :, text_seq_length:] = apply_rotary_emb(
+                                query[b:b+1, :, text_seq_length:], sel_rope_b
+                            )
+                            if not attn.is_cross_attention:
+                                key[b:b+1, :, text_seq_length:] = apply_rotary_emb(
+                                    key[b:b+1, :, text_seq_length:], sel_rope_b
+                                )
+            else:
+                query[:, :, text_seq_length:] = apply_rotary_emb(query[:, :, text_seq_length:], image_rotary_emb)
+                if not attn.is_cross_attention:
+                    key[:, :, text_seq_length:] = apply_rotary_emb(key[:, :, text_seq_length:], image_rotary_emb)
+
+        # Proportional attention bias
+        prop_attn_mask = attention_mask
+        if merge_info is not None and merge_cfg is not None and merge_cfg.prop_attn:
+            import sys
+            from pathlib import Path as _P
+            _sd = str(_P(__file__).resolve().parents[4] / "src")
+            if _sd not in sys.path:
+                sys.path.insert(0, _sd)
+            from tokmerge.merging import size_log_bias
+            bias = size_log_bias(merge_info, text_seq_length, attn.heads)
+            bias = bias.to(query.dtype).to(query.device)
+            if prop_attn_mask is not None:
+                prop_attn_mask = prop_attn_mask + bias
+            else:
+                prop_attn_mask = bias
 
         hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            query, key, value, attn_mask=prop_attn_mask, dropout_p=0.0, is_causal=False
         )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)

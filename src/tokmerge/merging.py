@@ -1,0 +1,344 @@
+"""Pure-tensor token merging: bipartite soft matching, merge, unmerge.
+
+No diffusers dependency. All functions operate on the video-token portion only;
+the caller splits text/video before calling and re-concatenates after.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn.functional as F
+
+
+@dataclass
+class MergeConfig:
+    enabled: bool = False
+    ratio: float = 0.0
+    mode: str = "spatial"               # "spatial" | "spatiotemporal"
+    scope: str = "block"                # "block" | "attn_only" | "pre_attn_restore"
+    rope_mode: str = "pre_rope"         # "pre_rope" | "dst"
+    prop_attn: bool = True              # log(size) bias in softmax
+    match_feature: str = "hidden_norm"  # "hidden_norm" | "attn_k"
+    layers: tuple[int, ...] = ()
+    temporal_window: int = 1
+    protect_first_frame: bool = True    # latent frame 0
+    skip_early_ratio: float = 0.0       # skip merging for the first X% of timesteps (0-1)
+
+
+@dataclass
+class RestoreInfo:
+    src_idx: torch.Tensor    # [B, r]       — indices of absorbed tokens
+    dst_idx: torch.Tensor    # [B, r]       — indices they merged into
+    keep_idx: torch.Tensor   # [B, N-r]     — indices of kept tokens
+    sizes: torch.Tensor      # [B, N-r]     — weight per kept token (≥1)
+    num_video_tokens: int
+    grid: tuple[int, int, int]  # (frames, gh, gw)
+
+
+_partition_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_indices_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_fixed_match_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
+def _build_spatial_partition(
+    n_video: int, frames: int, gh: int, gw: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split video tokens into two disjoint sets (src, dst) for bipartite matching.
+
+    For spatial mode we use a checkerboard on the (h, w) grid within each frame
+    so that roughly half the tokens are in each set. Results are cached.
+    """
+    key = (n_video, frames, gh, gw)
+    if key in _partition_cache:
+        return _partition_cache[key]
+
+    idx = torch.arange(n_video)
+    hw = idx % (gh * gw)
+    h = hw // gw
+    w = hw % gw
+    is_src = ((h + w) % 2 == 0)
+    result = (is_src, ~is_src)
+    _partition_cache[key] = result
+    return result
+
+
+def _build_temporal_mask(
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    gh: int,
+    gw: int,
+    temporal_window: int,
+) -> torch.Tensor:
+    """Build temporal-neighborhood mask for spatiotemporal matching.
+
+    Returns temporal_mask[i, j] which is True when src token i and dst token j
+    are within temporal_window frames of each other.
+    Uses the actual post-filtered src/dst indices.
+    """
+    src_frames = src_indices // (gh * gw)
+    dst_frames = dst_indices // (gh * gw)
+    return (src_frames.unsqueeze(1) - dst_frames.unsqueeze(0)).abs() <= temporal_window
+
+
+def bipartite_soft_match(
+    metric: torch.Tensor,
+    r: int,
+    frames: int,
+    gh: int,
+    gw: int,
+    mode: str = "spatial",
+    temporal_window: int = 1,
+    protect_first_frame: bool = True,
+    match_feature: str = "hidden_norm",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bipartite soft matching on L2-normalised token features.
+
+    Args:
+        metric: [B, N, C] — L2-normalised hidden states (video tokens only).
+        r: number of tokens to merge (remove).
+        frames, gh, gw: video grid dimensions so that N = frames * gh * gw.
+        mode: "spatial" or "spatiotemporal".
+        temporal_window: for spatiotemporal, frame distance for cross-frame matching.
+        protect_first_frame: never absorb tokens from latent frame 0.
+
+    Returns:
+        src_idx:  [B, r]    — absorbed token indices (into original N).
+        dst_idx:  [B, r]    — destination token indices they merge into.
+        keep_idx: [B, N-r]  — indices of all kept tokens (sorted).
+        sizes:    [B, N-r]  — initial size of each kept token (all 1.0).
+    """
+    B, N, C = metric.shape
+    assert N == frames * gh * gw, f"N={N} != frames*gh*gw={frames*gh*gw}"
+
+    if r == 0:
+        keep_idx = torch.arange(N, device=metric.device).unsqueeze(0).expand(B, -1)
+        sizes = torch.ones(B, N, device=metric.device, dtype=metric.dtype)
+        src_idx = torch.empty(B, 0, dtype=torch.long, device=metric.device)
+        dst_idx = torch.empty(B, 0, dtype=torch.long, device=metric.device)
+        return src_idx, dst_idx, keep_idx, sizes
+
+    _idx_key = (N, frames, gh, gw, mode, protect_first_frame, str(metric.device))
+    if _idx_key in _indices_cache:
+        src_indices, dst_indices = _indices_cache[_idx_key]
+    else:
+        if mode in ("spatial", "spatiotemporal"):
+            is_src, is_dst = _build_spatial_partition(N, frames, gh, gw)
+            is_src = is_src.to(metric.device)
+            is_dst = is_dst.to(metric.device)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        if protect_first_frame:
+            frame0_mask = torch.arange(N, device=metric.device) < (gh * gw)
+            is_src = is_src & ~frame0_mask
+
+        src_indices = is_src.nonzero(as_tuple=False).squeeze(-1)  # [n_src]
+        dst_indices = is_dst.nonzero(as_tuple=False).squeeze(-1)  # [n_dst]
+        _indices_cache[_idx_key] = (src_indices, dst_indices)
+
+    n_src = src_indices.shape[0]
+    n_dst = dst_indices.shape[0]
+    r = min(r, n_src)
+
+    if r == 0:
+        keep_idx = torch.arange(N, device=metric.device).unsqueeze(0).expand(B, -1)
+        sizes = torch.ones(B, N, device=metric.device, dtype=metric.dtype)
+        src_idx = torch.empty(B, 0, dtype=torch.long, device=metric.device)
+        dst_idx = torch.empty(B, 0, dtype=torch.long, device=metric.device)
+        return src_idx, dst_idx, keep_idx, sizes
+
+    if match_feature == "fixed":
+        # Fixed positional merge: pair each src with its nearest dst neighbor.
+        # Fully deterministic, no similarity computation, batch-independent.
+        _fixed_key = (N, frames, gh, gw, mode, protect_first_frame, r, str(metric.device))
+        if _fixed_key in _fixed_match_cache:
+            batch_src_idx, batch_dst_idx, keep_idx = _fixed_match_cache[_fixed_key]
+            batch_src_idx = batch_src_idx.expand(B, -1)
+            batch_dst_idx = batch_dst_idx.expand(B, -1)
+            keep_idx = keep_idx.expand(B, -1)
+        else:
+            # For each src, find nearest dst by L1 grid distance
+            src_hw = src_indices % (gh * gw)
+            src_h, src_w = src_hw // gw, src_hw % gw
+            src_t = src_indices // (gh * gw)
+
+            dst_hw = dst_indices % (gh * gw)
+            dst_h, dst_w = dst_hw // gw, dst_hw % gw
+            dst_t = dst_indices // (gh * gw)
+
+            # Grid distance: |h_diff| + |w_diff|; for spatial, same frame, so no t
+            h_diff = (src_h.unsqueeze(1) - dst_h.unsqueeze(0)).abs()
+            w_diff = (src_w.unsqueeze(1) - dst_w.unsqueeze(0)).abs()
+            t_diff = (src_t.unsqueeze(1) - dst_t.unsqueeze(0)).abs()
+            grid_dist = h_diff + w_diff + t_diff * (gh + gw)  # penalize cross-frame
+
+            if mode == "spatiotemporal":
+                grid_dist = grid_dist.masked_fill(t_diff > temporal_window, 99999)
+
+            nearest_dst = grid_dist.argmin(dim=1)  # [n_src]
+            # Take first r src tokens (they're all equally good in fixed mode)
+            take_src = src_indices[:r]  # [r]
+            take_dst = dst_indices[nearest_dst[:r]]  # [r]
+
+            removed = torch.zeros(N, dtype=torch.bool, device=metric.device)
+            removed[take_src] = True
+            keep = (~removed).nonzero(as_tuple=False).squeeze(-1)  # [N-r]
+
+            batch_src_idx = take_src.unsqueeze(0)
+            batch_dst_idx = take_dst.unsqueeze(0)
+            keep_idx = keep.unsqueeze(0)
+            _fixed_match_cache[_fixed_key] = (batch_src_idx, batch_dst_idx, keep_idx)
+            batch_src_idx = batch_src_idx.expand(B, -1)
+            batch_dst_idx = batch_dst_idx.expand(B, -1)
+            keep_idx = keep_idx.expand(B, -1)
+
+        sizes = torch.ones(B, N - r, device=metric.device, dtype=metric.dtype)
+        return batch_src_idx, batch_dst_idx, keep_idx, sizes
+
+    # Content-adaptive matching (hidden_norm / attn_k)
+    # Subsample feature dims for matching to reduce bmm cost (1920 → ≤128)
+    _MATCH_DIM = 128
+    if C > _MATCH_DIM:
+        stride = C // _MATCH_DIM
+        metric_sub = metric[:, :, ::stride]  # [B, N, ~128]
+    else:
+        metric_sub = metric
+
+    metric_src = metric_sub[:, src_indices]  # [B, n_src, C']
+    metric_dst = metric_sub[:, dst_indices]  # [B, n_dst, C']
+
+    scores = torch.bmm(metric_src, metric_dst.transpose(1, 2))  # [B, n_src, n_dst]
+
+    if mode == "spatiotemporal":
+        temporal_mask = _build_temporal_mask(
+            src_indices, dst_indices, gh, gw, temporal_window
+        ).to(metric.device)
+        scores = scores.masked_fill(~temporal_mask.unsqueeze(0), -torch.inf)
+
+    best_dst_score, best_dst_local = scores.max(dim=2)  # [B, n_src]
+    _, top_src_local = best_dst_score.topk(r, dim=1)  # [B, r]
+
+    batch_src_idx = src_indices[top_src_local]  # [B, r]
+    matched_dst_local = torch.gather(best_dst_local, 1, top_src_local)  # [B, r]
+    batch_dst_idx = dst_indices[matched_dst_local]  # [B, r]
+
+    removed = torch.zeros(B, N, dtype=torch.bool, device=metric.device)
+    removed.scatter_(1, batch_src_idx, True)
+    not_removed = (~removed).long()
+    sorted_indices = torch.argsort(-not_removed, dim=1, stable=True)
+    keep_idx = sorted_indices[:, :N - r]
+    keep_idx = keep_idx.sort(dim=1).values
+
+    sizes = torch.ones(B, N - r, device=metric.device, dtype=metric.dtype)
+
+    return batch_src_idx, batch_dst_idx, keep_idx, sizes
+
+
+def _find_positions_vectorized(keep_idx: torch.Tensor, dst_idx: torch.Tensor) -> torch.Tensor:
+    """For each element in dst_idx, find its position in keep_idx.
+
+    Assumes keep_idx is sorted along dim=1 (which it is by construction).
+    Uses searchsorted for O(r log K) instead of O(r * K).
+    """
+    return torch.searchsorted(keep_idx.contiguous(), dst_idx.contiguous())
+
+
+def merge_tokens(
+    x: torch.Tensor,
+    info: RestoreInfo,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Size-weighted average merge. Fully vectorized.
+
+    Args:
+        x: [B, N, C] video tokens.
+        info: RestoreInfo with indices and sizes.
+
+    Returns:
+        merged: [B, N-r, C] merged video tokens.
+        new_sizes: [B, N-r] updated sizes after absorbing src tokens.
+    """
+    B, N, C = x.shape
+    r = info.src_idx.shape[1]
+
+    if r == 0:
+        return x.clone(), info.sizes.clone()
+
+    K = info.keep_idx.shape[1]
+    keep = torch.gather(x, 1, info.keep_idx.unsqueeze(-1).expand(-1, -1, C))  # [B, K, C]
+    src = torch.gather(x, 1, info.src_idx.unsqueeze(-1).expand(-1, -1, C))    # [B, r, C]
+
+    dst_in_keep = _find_positions_vectorized(info.keep_idx, info.dst_idx)  # [B, r]
+
+    new_sizes = info.sizes.clone()  # [B, K]
+
+    # Vectorized scatter-add: accumulate src tokens into their dst positions
+    # First, count how many sources go to each dst position
+    size_delta = torch.zeros(B, K, device=x.device, dtype=x.dtype)
+    size_delta.scatter_add_(1, dst_in_keep, torch.ones_like(dst_in_keep, dtype=x.dtype))
+
+    # Accumulate src values weighted by 1 into dst positions
+    weighted_src = torch.zeros(B, K, C, device=x.device, dtype=x.dtype)
+    weighted_src.scatter_add_(1, dst_in_keep.unsqueeze(-1).expand(-1, -1, C), src)
+
+    # Compute new values: (old_val * old_size + accumulated_src) / (old_size + count)
+    old_sizes = new_sizes.clone()
+    new_sizes = old_sizes + size_delta
+    keep = (keep * old_sizes.unsqueeze(-1) + weighted_src) / new_sizes.unsqueeze(-1).clamp(min=1)
+
+    return keep, new_sizes
+
+
+def unmerge_tokens(
+    merged_x: torch.Tensor,
+    info: RestoreInfo,
+) -> torch.Tensor:
+    """Scatter merged tokens back to full layout. Fully vectorized.
+
+    Absorbed tokens copy their destination's value.
+
+    Args:
+        merged_x: [B, N-r, C]
+        info: RestoreInfo.
+
+    Returns:
+        full_x: [B, N, C]
+    """
+    B, _, C = merged_x.shape
+    N = info.num_video_tokens
+    r = info.src_idx.shape[1]
+
+    if r == 0:
+        return merged_x.clone()
+
+    full_x = torch.zeros(B, N, C, device=merged_x.device, dtype=merged_x.dtype)
+    full_x.scatter_(1, info.keep_idx.unsqueeze(-1).expand(-1, -1, C), merged_x)
+
+    dst_in_keep = _find_positions_vectorized(info.keep_idx, info.dst_idx)
+    dst_values = torch.gather(
+        merged_x, 1, dst_in_keep.unsqueeze(-1).expand(-1, -1, C)
+    )
+    full_x.scatter_(1, info.src_idx.unsqueeze(-1).expand(-1, -1, C), dst_values)
+
+    return full_x
+
+
+def size_log_bias(
+    info: RestoreInfo,
+    num_text_tokens: int,
+    num_heads: int,
+) -> torch.Tensor:
+    """Additive attention bias: log(sizes) for proportional attention.
+
+    Returns a tensor broadcastable to [B, num_heads, Q_len, K_len] where
+    K_len = num_text_tokens + (N_video - r). Text keys get zero bias.
+    """
+    B = info.sizes.shape[0]
+    n_merged = info.sizes.shape[1]  # N_video - r
+
+    text_bias = torch.zeros(B, num_text_tokens, device=info.sizes.device, dtype=info.sizes.dtype)
+    video_bias = info.sizes.clamp(min=1).log()  # [B, n_merged]
+
+    # [B, 1, 1, num_text + n_merged] — broadcast over heads and query positions
+    bias = torch.cat([text_bias, video_bias], dim=1)  # [B, K_len]
+    return bias.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, K_len]

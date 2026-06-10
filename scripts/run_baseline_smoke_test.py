@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from diffusers import CogVideoXDDIMScheduler, CogVideoXDPMScheduler, CogVideoXPipeline
 from diffusers.utils import export_to_video
@@ -57,7 +58,7 @@ PRESETS = {
         "guidance_scale": 5.5,
         "fps": 8,
         "dtype": "float16",
-        "offload": "sequential",
+        "offload": "none",
     },
 }
 
@@ -114,6 +115,21 @@ def parse_args() -> argparse.Namespace:
         "--device",
         default="cuda",
         help="Target device when --offload none is used. Defaults to cuda.",
+    )
+    parser.add_argument(
+        "--transformer-timing",
+        action="store_true",
+        help="Measure per-step transformer forward time with CUDA events.",
+    )
+    parser.add_argument(
+        "--merge-config",
+        default=None,
+        help="Path to a token-merging JSON config. None = baseline (no merging).",
+    )
+    parser.add_argument(
+        "--save-latents",
+        default=None,
+        help="Save final denoised latents to this .pt path (for noise-floor measurement).",
     )
     return parser.parse_args()
 
@@ -194,6 +210,53 @@ def download_snapshot(model_id: str, cache_dir: str | None, local_files_only: bo
     )
 
 
+class TransformerTimingHooks:
+    """CUDA-event timing around each transformer forward call."""
+
+    def __init__(self):
+        self.step_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._start: torch.cuda.Event | None = None
+        self._handles: list = []
+
+    def attach(self, transformer: torch.nn.Module) -> None:
+        h1 = transformer.register_forward_pre_hook(self._pre_hook)
+        h2 = transformer.register_forward_hook(self._post_hook)
+        self._handles = [h1, h2]
+
+    def detach(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    def _pre_hook(self, module, args):
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        self._start = start
+
+    def _post_hook(self, module, args, output):
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self.step_events.append((self._start, end))
+
+    def compute(self) -> dict:
+        if not self.step_events:
+            return {
+                "transformer_seconds": None,
+                "avg_step_seconds": None,
+                "first_step_seconds": None,
+            }
+        torch.cuda.synchronize()
+        step_ms = [s.elapsed_time(e) for s, e in self.step_events]
+        total_s = sum(step_ms) / 1000.0
+        first_s = step_ms[0] / 1000.0
+        avg_s = sum(step_ms[1:]) / len(step_ms[1:]) / 1000.0 if len(step_ms) > 1 else first_s
+        return {
+            "transformer_seconds": round(total_s, 4),
+            "avg_step_seconds": round(avg_s, 4),
+            "first_step_seconds": round(first_s, 4),
+        }
+
+
 def main() -> int:
     args = apply_preset_defaults(parse_args())
 
@@ -237,19 +300,46 @@ def main() -> int:
     load_elapsed = time.perf_counter() - load_start
 
     use_dynamic_cfg = configure_pipeline(pipe, args.model_id, args.offload, args.device)
+
+    merge_cfg = None
+    if args.merge_config:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+        from tokmerge.runtime import load_merge_config, attach_merge_config
+        merge_cfg = load_merge_config(args.merge_config)
+        attach_merge_config(pipe.transformer, merge_cfg)
+        print(f"  merge_config={args.merge_config}")
+        print(f"  merge_scope={merge_cfg.scope}, ratio={merge_cfg.ratio}, mode={merge_cfg.mode}")
+        print(f"  merge_layers={merge_cfg.layers}")
+
     generator = torch.Generator().manual_seed(args.seed)
+
+    timing_hooks = None
+    if args.transformer_timing and torch.cuda.is_available():
+        timing_hooks = TransformerTimingHooks()
+        timing_hooks.attach(pipe.transformer)
+
+    latent_capture: dict[str, torch.Tensor] = {}
+    if args.save_latents:
+
+        def _capture_latent_callback(pipe_obj, step, timestep, callback_kwargs):
+            if step == args.num_inference_steps - 1:
+                latent_capture["final"] = callback_kwargs["latents"].detach().cpu()
+            return callback_kwargs
 
     print("Running generation...")
     print(
         f"  prompt={args.prompt}\n"
         f"  size={args.width}x{args.height}\n"
         f"  frames={args.num_frames}\n"
-        f"  steps={args.num_inference_steps}"
+        f"  steps={args.num_inference_steps}\n"
+        f"  transformer_timing={args.transformer_timing}"
     )
 
     maybe_reset_cuda_stats()
     infer_start = time.perf_counter()
-    result = pipe(
+
+    pipe_kwargs = dict(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         height=args.height,
@@ -260,9 +350,29 @@ def main() -> int:
         use_dynamic_cfg=use_dynamic_cfg,
         generator=generator,
     )
+    if args.save_latents:
+        pipe_kwargs["callback_on_step_end"] = _capture_latent_callback
+        pipe_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+
+    result = pipe(**pipe_kwargs)
+
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     infer_elapsed = time.perf_counter() - infer_start
+
+    timing_data = timing_hooks.compute() if timing_hooks else {
+        "transformer_seconds": None,
+        "avg_step_seconds": None,
+        "first_step_seconds": None,
+    }
+    if timing_hooks:
+        timing_hooks.detach()
+
+    if args.save_latents and "final" in latent_capture:
+        latent_path = Path(args.save_latents)
+        latent_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(latent_capture["final"], str(latent_path))
+        print(f"  saved_latents={latent_path.resolve()}")
 
     frames = result.frames[0]
     export_to_video(frames, str(output_path), fps=args.fps)
@@ -281,12 +391,24 @@ def main() -> int:
         "guidance_scale": args.guidance_scale,
         "dtype": args.dtype,
         "offload": args.offload,
+        "offload_mode": args.offload,
         "download_workers": args.download_workers,
         "diffusers_version": diffusers_pkg.__version__,
         "diffusers_path": str(Path(diffusers_pkg.__file__).resolve()),
         "snapshot_path": snapshot_path,
         "load_seconds": round(load_elapsed, 3),
         "inference_seconds": round(infer_elapsed, 3),
+        "transformer_seconds": timing_data["transformer_seconds"],
+        "avg_step_seconds": timing_data["avg_step_seconds"],
+        "first_step_seconds": timing_data["first_step_seconds"],
+        "merge_enabled": merge_cfg.enabled if merge_cfg else False,
+        "merge_config": args.merge_config,
+        "merge_scope": merge_cfg.scope if merge_cfg else None,
+        "merge_ratio": merge_cfg.ratio if merge_cfg else None,
+        "merge_mode": merge_cfg.mode if merge_cfg else None,
+        "rope_mode": merge_cfg.rope_mode if merge_cfg else None,
+        "prop_attn": merge_cfg.prop_attn if merge_cfg else None,
+        "merge_overhead_seconds": None,
         "peak_gpu_memory_gib": None if peak_gpu_memory_gib() is None else round(peak_gpu_memory_gib(), 3),
         "output_path": str(output_path.resolve()),
     }
@@ -299,6 +421,10 @@ def main() -> int:
     print(f"  metadata={metadata_path.resolve()}")
     print(f"  load_seconds={metadata['load_seconds']}")
     print(f"  inference_seconds={metadata['inference_seconds']}")
+    if timing_data["transformer_seconds"] is not None:
+        print(f"  transformer_seconds={timing_data['transformer_seconds']}")
+        print(f"  avg_step_seconds={timing_data['avg_step_seconds']}")
+        print(f"  first_step_seconds={timing_data['first_step_seconds']}")
     print(f"  peak_gpu_memory_gib={metadata['peak_gpu_memory_gib']}")
     return 0
 

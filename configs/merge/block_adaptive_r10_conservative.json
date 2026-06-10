@@ -1,0 +1,12 @@
+{
+  "enabled": true,
+  "ratio": 0.1,
+  "mode": "spatial",
+  "scope": "block",
+  "rope_mode": "pre_rope",
+  "prop_attn": false,
+  "match_feature": "hidden_norm",
+  "layers": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  "temporal_window": 1,
+  "protect_first_frame": true
+}

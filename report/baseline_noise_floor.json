@@ -1,0 +1,15 @@
+{
+  "preset": "smoke",
+  "seed": 123,
+  "latent_shape": [
+    1,
+    3,
+    16,
+    32,
+    48
+  ],
+  "latent_dtype": "torch.float16",
+  "mse": 0.0,
+  "max_abs_diff": 0.0,
+  "identical": true
+}
