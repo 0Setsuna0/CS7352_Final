@@ -299,3 +299,16 @@ dynamic_degree 不低于 baseline 的 90%
 当前方法证明了 naive block TokenMerge 可以加速，但质量不可接受；下一版应转向 KV-only attention merge + importance protection，并用 cache/broadcast 方法作为强基线。
 ```
 
+## 9. 当前实现状态：ToMA-like v1
+
+已落地第一版 ToMA-like 工程近似：
+
+- 新增 `scope="kv_only"`：保留全长 Query/输出位置，只合并 video K/V。
+- 新增 `partition="checkerboard_shifted"`：不同层交替棋盘格源/目标，降低固定网格纹。
+- 新增 `reuse_interval`：每个 transformer block 每隔 N 次调用重新计算一次 matching，中间复用上一次 merge pattern，减少 adaptive matching 开销。
+- 新增配置：
+  - `configs/merge/toma_kv_spatial_r20_reuse4.json`
+  - `configs/merge/toma_kv_spatial_r30_reuse4.json`
+  - `configs/merge/toma_kv_st_r10_reuse4.json`
+
+需要明确：这还不是 ToMA 论文的完整 attention-matrix merge/unmerge 复现；它是适配当前 CogVideoX/diffusers 代码结构的第一步，目标是先验证 pattern reuse + KV-only 是否能在不明显伤画质的情况下提高速度。

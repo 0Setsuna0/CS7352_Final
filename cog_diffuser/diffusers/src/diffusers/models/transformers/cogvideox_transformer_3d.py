@@ -159,25 +159,59 @@ class CogVideoXBlock(nn.Module):
             grid_t, grid_h, grid_w = attention_kwargs["_tokmerge_grid"]
             N_video = norm_hidden_states.shape[1]
             r = int(N_video * merge_cfg.ratio)
+            partition = getattr(merge_cfg, "partition", "checkerboard")
+            partition_offset = getattr(self, "_block_index", 0)
+            reuse_interval = max(1, int(getattr(merge_cfg, "reuse_interval", 1)))
+            call_idx = getattr(self, "_tokmerge_call_idx", 0)
+            self._tokmerge_call_idx = call_idx + 1
+            cache_key = (
+                norm_hidden_states.shape[0],
+                N_video,
+                r,
+                grid_t,
+                grid_h,
+                grid_w,
+                merge_cfg.mode,
+                merge_cfg.temporal_window,
+                merge_cfg.protect_first_frame,
+                merge_cfg.match_feature,
+                partition,
+                partition_offset % 2,
+                str(norm_hidden_states.device),
+            )
+            cached_info = getattr(self, "_tokmerge_cached_info", None)
+            cached_key = getattr(self, "_tokmerge_cached_key", None)
+            should_reuse = (
+                reuse_interval > 1
+                and cached_info is not None
+                and cached_key == cache_key
+                and call_idx % reuse_interval != 0
+            )
 
-            if merge_cfg.match_feature == "fixed":
-                metric = norm_hidden_states[:, :, :1]
+            if should_reuse:
+                info = cached_info
             else:
-                metric = torch.nn.functional.normalize(norm_hidden_states, dim=-1)
-            src_idx, dst_idx, keep_idx, sizes = _bsm(
-                metric, r, grid_t, grid_h, grid_w,
-                mode=merge_cfg.mode,
-                temporal_window=merge_cfg.temporal_window,
-                protect_first_frame=merge_cfg.protect_first_frame,
-                match_feature=merge_cfg.match_feature,
-                partition=getattr(merge_cfg, "partition", "checkerboard"),
-                partition_offset=getattr(self, "_block_index", 0),
-            )
-            info = _RestoreInfo(
-                src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
-                sizes=sizes, num_video_tokens=N_video,
-                grid=(grid_t, grid_h, grid_w),
-            )
+                if merge_cfg.match_feature == "fixed":
+                    metric = norm_hidden_states[:, :, :1]
+                else:
+                    metric = torch.nn.functional.normalize(norm_hidden_states, dim=-1)
+                src_idx, dst_idx, keep_idx, sizes = _bsm(
+                    metric, r, grid_t, grid_h, grid_w,
+                    mode=merge_cfg.mode,
+                    temporal_window=merge_cfg.temporal_window,
+                    protect_first_frame=merge_cfg.protect_first_frame,
+                    match_feature=merge_cfg.match_feature,
+                    partition=partition,
+                    partition_offset=partition_offset,
+                )
+                info = _RestoreInfo(
+                    src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
+                    sizes=sizes, num_video_tokens=N_video,
+                    grid=(grid_t, grid_h, grid_w),
+                )
+                if reuse_interval > 1:
+                    self._tokmerge_cached_info = info
+                    self._tokmerge_cached_key = cache_key
 
             clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
 

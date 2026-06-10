@@ -147,6 +147,7 @@ def run_generation(
         "prop_attn": merge_cfg.prop_attn if merge_cfg else None,
         "match_feature": merge_cfg.match_feature if merge_cfg else None,
         "partition": merge_cfg.partition if merge_cfg else None,
+        "reuse_interval": merge_cfg.reuse_interval if merge_cfg else None,
         "layers": list(merge_cfg.layers) if merge_cfg else None,
         "raw_layers": config_raw.get("layers"),
         "temporal_window": merge_cfg.temporal_window if merge_cfg else None,
@@ -199,6 +200,7 @@ SUMMARY_FIELDS = [
     "match_feature",
     "prop_attn",
     "partition",
+    "reuse_interval",
     "raw_layers",
     "layers",
     "skip_early_ratio",
@@ -257,8 +259,8 @@ def write_summary(rows: list[dict[str, Any]]) -> None:
         f"- Size: `{quality._WIDTH}x{quality._HEIGHT}`, frames: `{quality._NUM_FRAMES}`, steps: `{quality._NUM_INFERENCE_STEPS}`",
         f"- Offload: `{quality._OFFLOAD_MODE}`, dtype: `{quality._DTYPE_NAME}`, seed: `{quality._SEED}`",
         "",
-        "| Experiment | Status | Ratio | Mode | Scope | Match | Prop | Partition | Layers | Skip | Inference s | Transformer s | E2E speedup | Transformer speedup | Peak GiB | Video | Error |",
-        "|---|---|---:|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---|---|",
+        "| Experiment | Status | Ratio | Mode | Scope | Match | Prop | Partition | Reuse | Layers | Skip | Inference s | Transformer s | E2E speedup | Transformer speedup | Peak GiB | Video | Error |",
+        "|---|---|---:|---|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for row in rows:
         video = Path(row.get("output_path", "")).name if row.get("output_path") else ""
@@ -275,6 +277,7 @@ def write_summary(rows: list[dict[str, Any]]) -> None:
                     row.get("match_feature"),
                     row.get("prop_attn"),
                     row.get("partition"),
+                    row.get("reuse_interval"),
                     row.get("raw_layers"),
                     row.get("skip_early_ratio"),
                     row.get("inference_seconds"),

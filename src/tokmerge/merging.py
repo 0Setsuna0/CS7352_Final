@@ -25,6 +25,7 @@ class MergeConfig:
     protect_first_frame: bool = True    # latent frame 0
     skip_early_ratio: float = 0.0       # skip merging for the first X% of timesteps (0-1)
     partition: str = "checkerboard"     # "checkerboard" | "checkerboard_shifted"
+    reuse_interval: int = 1             # reuse matching pattern for this many block calls
 
 
 @dataclass

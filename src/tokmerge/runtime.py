@@ -49,6 +49,10 @@ def attach_merge_config(transformer, cfg: MergeConfig) -> None:
     for idx, block in enumerate(transformer.transformer_blocks):
         block._block_index = idx
         block._merge_cfg = cfg
+        block._tokmerge_call_idx = 0
+        for attr in ("_tokmerge_cached_info", "_tokmerge_cached_key"):
+            if hasattr(block, attr):
+                delattr(block, attr)
 
 
 def detach_merge_config(transformer) -> None:
@@ -58,3 +62,6 @@ def detach_merge_config(transformer) -> None:
         block._merge_cfg = None
         if hasattr(block, "_block_index"):
             del block._block_index
+        for attr in ("_tokmerge_call_idx", "_tokmerge_cached_info", "_tokmerge_cached_key"):
+            if hasattr(block, attr):
+                delattr(block, attr)

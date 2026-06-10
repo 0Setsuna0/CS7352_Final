@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "ratio": 0.2,
+  "mode": "spatial",
+  "scope": "kv_only",
+  "rope_mode": "pre_rope",
+  "prop_attn": true,
+  "match_feature": "hidden_norm",
+  "layers": "middle_wide",
+  "temporal_window": 1,
+  "protect_first_frame": true,
+  "skip_early_ratio": 0.4,
+  "partition": "checkerboard_shifted",
+  "reuse_interval": 4
+}
