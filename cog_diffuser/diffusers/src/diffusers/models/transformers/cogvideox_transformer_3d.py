@@ -29,6 +29,9 @@ from tokmerge.merging import (
     bipartite_soft_match as _bsm,
     merge_tokens as _merge,
     unmerge_tokens as _unmerge,
+    unmerge_tokens_interpolated as _unmerge_interp,
+    compute_effective_ratio,
+    compute_layer_ratio,
     RestoreInfo as _RestoreInfo,
 )
 
@@ -158,7 +161,16 @@ class CogVideoXBlock(nn.Module):
         if merge_active:
             grid_t, grid_h, grid_w = attention_kwargs["_tokmerge_grid"]
             N_video = norm_hidden_states.shape[1]
-            r = int(N_video * merge_cfg.ratio)
+
+            # Use timestep-scheduled ratio from transformer forward, then apply layer decay
+            effective_ratio = attention_kwargs.get("_tokmerge_effective_ratio", merge_cfg.ratio)
+            layer_decay = getattr(merge_cfg, "layer_ratio_decay", 0.0)
+            if layer_decay > 0:
+                effective_ratio = compute_layer_ratio(
+                    effective_ratio, self._block_index, merge_cfg.layers, layer_decay
+                )
+
+            r = int(N_video * effective_ratio)
             partition = getattr(merge_cfg, "partition", "checkerboard")
             partition_offset = getattr(self, "_block_index", 0)
             reuse_interval = max(1, int(getattr(merge_cfg, "reuse_interval", 1)))
@@ -203,6 +215,8 @@ class CogVideoXBlock(nn.Module):
                     match_feature=merge_cfg.match_feature,
                     partition=partition,
                     partition_offset=partition_offset,
+                    protect_topk_ratio=getattr(merge_cfg, "protect_topk_ratio", 0.0),
+                    cfg_consistent=getattr(merge_cfg, "cfg_consistent", False),
                 )
                 info = _RestoreInfo(
                     src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
@@ -214,6 +228,9 @@ class CogVideoXBlock(nn.Module):
                     self._tokmerge_cached_key = cache_key
 
             clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+
+            _do_interp = getattr(merge_cfg, "unmerge_mode", "copy") == "interpolate"
+            _unmerge_fn = _unmerge_interp if _do_interp else _unmerge
 
             if merge_cfg.scope == "pre_attn_restore":
                 merged_video, new_sizes = _merge(norm_hidden_states, info)
@@ -228,7 +245,7 @@ class CogVideoXBlock(nn.Module):
                     image_rotary_emb=image_rotary_emb,
                     **clean_kwargs,
                 )
-                attn_hidden_states = _unmerge(attn_hidden_states, info)
+                attn_hidden_states = _unmerge_fn(attn_hidden_states, info)
 
             elif merge_cfg.scope == "kv_only":
                 # KV-only keeps every query/output position alive and only
@@ -275,7 +292,7 @@ class CogVideoXBlock(nn.Module):
                     processor._tokmerge_cfg = None
 
                 if merge_cfg.scope == "block":
-                    attn_hidden_states = _unmerge(attn_hidden_states, info)
+                    attn_hidden_states = _unmerge_fn(attn_hidden_states, info)
             else:
                 raise ValueError(f"Unknown merge scope: {merge_cfg.scope}")
         else:
@@ -314,7 +331,7 @@ class CogVideoXBlock(nn.Module):
             ff_output = self.ff(norm_cat)
             ff_text = ff_output[:, :text_seq_length]
             ff_video_merged = ff_output[:, text_seq_length:]
-            ff_video = _unmerge(ff_video_merged, ff_info)
+            ff_video = _unmerge_fn(ff_video_merged, ff_info)
             hidden_states = hidden_states + gate_ff * ff_video
             encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_text
         else:
@@ -615,15 +632,24 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
             if attention_kwargs is None:
                 attention_kwargs = {}
 
-            # Skip merging for early (noisy) timesteps to avoid structured artifacts
-            skip_early = self._merge_cfg.skip_early_ratio
+            # Compute effective ratio using timestep-adaptive schedule
             t_val = timesteps.float().mean().item() if isinstance(timesteps, torch.Tensor) else float(timesteps)
-            merge_disabled = skip_early > 0 and t_val > 1000.0 * (1.0 - skip_early)
+            cfg = self._merge_cfg
+            effective_ratio = compute_effective_ratio(
+                cfg.ratio, t_val,
+                schedule=getattr(cfg, "ratio_schedule", "constant"),
+                skip_early=cfg.skip_early_ratio,
+                skip_late=getattr(cfg, "skip_late_ratio", 0.0),
+            )
 
-            if merge_disabled:
+            if effective_ratio <= 0:
                 attention_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
             else:
-                attention_kwargs = {**attention_kwargs, "_tokmerge_grid": (grid_t, grid_h, grid_w)}
+                attention_kwargs = {
+                    **attention_kwargs,
+                    "_tokmerge_grid": (grid_t, grid_h, grid_w),
+                    "_tokmerge_effective_ratio": effective_ratio,
+                }
 
         # 3. Transformer blocks
         for i, block in enumerate(self.transformer_blocks):

@@ -221,11 +221,73 @@ cs7352/
 
 ---
 
-## 七、待完成工作
+## 七、v4 画质增强工程（新增）
+
+### 7.1 Timestep-Adaptive Ratio Schedule
+
+实现了 4 种 merge ratio 调度策略，让 merge 强度随 denoising 进度自适应变化：
+
+- `constant`：固定 ratio（原始行为）
+- `cosine`：正弦半波，在活跃窗口中段达到峰值
+- `bell`：高斯钟形，peak 在 40%-60% 进度
+- `linear_decay`：线性衰减至 0
+
+配合 `skip_early_ratio` + `skip_late_ratio` 形成完整的时间窗口控制：
+- 早期（高噪声）：不 merge → 保护结构成形
+- 中期：merge 强度最大 → 获取速度
+- 晚期（精细细节）：不 merge → 保护纹理和细节
+
+### 7.2 Importance-Aware Token Protection
+
+引入 `protect_topk_ratio` 参数，按 token 激活幅度保护高语义重要性的 token 不被吸收：
+
+- 计算 src token 集合的 L2-norm 作为 importance 度量
+- Top-K 高重要性 token 通过 score penalty 避免被选中合并
+- 保护主体（熊猫、吉他、手部）等高激活区域
+
+### 7.3 Per-Layer Ratio Decay
+
+通过 `layer_ratio_decay` 参数，让不同深度的 transformer block 使用不同的 merge ratio：
+
+- 浅层 block（负责全局结构）使用完整 ratio → 速度最大化
+- 深层 block（负责细节恢复）使用衰减后的 ratio → 保护精细纹理
+- 公式：`effective_ratio = base * (1 - decay * rank / (n_active - 1))`
+
+### 7.4 CFG-Consistent Merge Pattern
+
+通过 `cfg_consistent=true`，强制 classifier-free guidance 的 conditional 和 unconditional 分支共享同一 merge pattern：
+
+- 避免两分支独立 matching 导致 CFG 差分时的空间错位
+- 统一使用 conditional 分支（batch[1]）的 matching 结果
+
+### 7.5 Interpolated Unmerge
+
+新增 `unmerge_mode="interpolate"` 替代原始的"复制 dst 值"策略：
+
+- 对每个被吸收的 src token，计算其 4-connected 空间邻居的均值
+- 最终值 = 70% × dst值 + 30% × 邻居均值
+- 显著减少"块状复制"感和网格纹伪影
+
+### 7.6 新增配置文件
+
+| 配置 | 描述 |
+|------|------|
+| `v4_block_cosine_r25.json` | 主推配置：cosine schedule + 全部 v4 增强 |
+| `v4_block_bell_r30.json` | 激进配置：bell schedule, r=0.3 |
+| `v4_block_conservative_r20.json` | 保守配置：middle layers, r=0.2 |
+| `v4_kv_cosine_r20.json` | KV-only scope + cosine schedule |
+| `v4_st_bell_r20.json` | 时空模式 + bell schedule |
+| `v4_block_aggressive_r40.json` | 极限测试：r=0.4 + 所有保护 |
+| `v4_ablation_no_schedule_r25.json` | 消融：无 schedule（对照组） |
+| `v4_ablation_no_protect_r25.json` | 消融：无 importance protection（对照组） |
+
+---
+
+## 八、待完成工作
 
 | 阶段 | 描述 | 状态 |
 |------|------|------|
-| Phase 7 | Micro-ablation + 默认参数冻结 | 未开始 |
+| Phase 7 | 跑 v4 配置 benchmark + 微消融 | 未开始 |
 | Phase 8 | Metrics (CLIP, VBench, dynamic_degree) + Final Matrix | 未开始 |
 | Phase 9 | 分析、图表、最终报告 | 未开始 |
-| 质量调优 | skip_early_ratio + 层数优化的系统评估 | 进行中 |
+| 质量验证 | v4 配置 vs 旧 block_r20 对比 | 未开始 |

@@ -28,7 +28,11 @@ def load_merge_config(path: str | Path) -> MergeConfig:
     """Load a JSON config and return a MergeConfig."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     layers = raw.pop("layers", ())
-    cfg = MergeConfig(**raw)
+    # Only pass keys that MergeConfig accepts
+    import dataclasses
+    valid_keys = {f.name for f in dataclasses.fields(MergeConfig)}
+    filtered = {k: v for k, v in raw.items() if k in valid_keys}
+    cfg = MergeConfig(**filtered)
     # layers is resolved later when num_layers is known
     cfg._raw_layers = layers
     return cfg

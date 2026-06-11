@@ -5,10 +5,10 @@ the caller splits text/video before calling and re-concatenates after.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 
 @dataclass
@@ -24,8 +24,15 @@ class MergeConfig:
     temporal_window: int = 1
     protect_first_frame: bool = True    # latent frame 0
     skip_early_ratio: float = 0.0       # skip merging for the first X% of timesteps (0-1)
+    skip_late_ratio: float = 0.0        # skip merging for the last X% of timesteps (0-1)
     partition: str = "checkerboard"     # "checkerboard" | "checkerboard_shifted"
     reuse_interval: int = 1             # reuse matching pattern for this many block calls
+    # --- Quality enhancements (v4) ---
+    ratio_schedule: str = "constant"    # "constant" | "cosine" | "bell" | "linear_decay"
+    layer_ratio_decay: float = 0.0      # 0=all layers same ratio; >0=later active layers use less
+    protect_topk_ratio: float = 0.0     # protect top X% tokens by activation magnitude
+    cfg_consistent: bool = False        # force cond/uncond branches to share merge pattern
+    unmerge_mode: str = "copy"          # "copy" | "interpolate"
 
 
 @dataclass
@@ -97,6 +104,95 @@ def _build_temporal_mask(
     return (src_frames.unsqueeze(1) - dst_frames.unsqueeze(0)).abs() <= temporal_window
 
 
+def compute_effective_ratio(
+    base_ratio: float,
+    timestep: float,
+    schedule: str,
+    skip_early: float = 0.0,
+    skip_late: float = 0.0,
+) -> float:
+    """Compute the effective merge ratio for a given timestep.
+
+    Args:
+        base_ratio: the configured max ratio.
+        timestep: current timestep value in [0, 1000] (higher = noisier/earlier).
+        schedule: "constant", "cosine", "bell", or "linear_decay".
+        skip_early: fraction of initial (noisy) steps to skip entirely.
+        skip_late: fraction of final (detail) steps to skip entirely.
+
+    Returns:
+        Effective ratio in [0, base_ratio].
+    """
+    if base_ratio <= 0:
+        return 0.0
+
+    progress = 1.0 - timestep / 1000.0  # 0 at start → 1 at end of denoising
+
+    if skip_early > 0 and progress < skip_early:
+        return 0.0
+    if skip_late > 0 and progress > (1.0 - skip_late):
+        return 0.0
+
+    if schedule == "constant":
+        return base_ratio
+    elif schedule == "cosine":
+        # Smooth bell-like curve peaking at midpoint of active window
+        active_start = skip_early
+        active_end = 1.0 - skip_late
+        active_len = active_end - active_start
+        if active_len <= 0:
+            return 0.0
+        local_progress = (progress - active_start) / active_len
+        return base_ratio * math.sin(math.pi * local_progress)
+    elif schedule == "bell":
+        # Gaussian-like: peaks around 40-60% overall progress
+        active_start = skip_early
+        active_end = 1.0 - skip_late
+        active_len = active_end - active_start
+        if active_len <= 0:
+            return 0.0
+        local_progress = (progress - active_start) / active_len
+        return base_ratio * math.exp(-((local_progress - 0.5) ** 2) / 0.08)
+    elif schedule == "linear_decay":
+        # Starts at full ratio, linearly decays to 0 at the end of active window
+        active_start = skip_early
+        active_end = 1.0 - skip_late
+        active_len = active_end - active_start
+        if active_len <= 0:
+            return 0.0
+        local_progress = (progress - active_start) / active_len
+        return base_ratio * (1.0 - local_progress)
+    else:
+        return base_ratio
+
+
+def compute_layer_ratio(
+    base_ratio: float,
+    block_index: int,
+    active_layers: tuple[int, ...],
+    layer_ratio_decay: float,
+) -> float:
+    """Apply per-layer ratio decay: earlier active layers keep full ratio,
+    later active layers use progressively less.
+
+    Args:
+        base_ratio: effective ratio after timestep scheduling.
+        block_index: current transformer block index.
+        active_layers: sorted tuple of all active layer indices.
+        layer_ratio_decay: 0 = uniform, 1 = last active layer gets 0 ratio.
+
+    Returns:
+        Layer-adjusted ratio.
+    """
+    if layer_ratio_decay <= 0 or len(active_layers) <= 1:
+        return base_ratio
+
+    rank = active_layers.index(block_index) if block_index in active_layers else 0
+    n = len(active_layers) - 1
+    decay_factor = 1.0 - layer_ratio_decay * (rank / n)
+    return base_ratio * max(0.0, decay_factor)
+
+
 def bipartite_soft_match(
     metric: torch.Tensor,
     r: int,
@@ -109,6 +205,8 @@ def bipartite_soft_match(
     match_feature: str = "hidden_norm",
     partition: str = "checkerboard",
     partition_offset: int = 0,
+    protect_topk_ratio: float = 0.0,
+    cfg_consistent: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bipartite soft matching on L2-normalised token features.
 
@@ -121,6 +219,8 @@ def bipartite_soft_match(
         protect_first_frame: never absorb tokens from latent frame 0.
         partition: source/destination partition strategy.
         partition_offset: parity offset for shifted partition strategies.
+        protect_topk_ratio: protect top X% of tokens by activation norm from absorption.
+        cfg_consistent: if True and B==2 (CFG), use cond branch pattern for both.
 
     Returns:
         src_idx:  [B, r]    — absorbed token indices (into original N).
@@ -265,12 +365,28 @@ def bipartite_soft_match(
         ).to(metric.device)
         scores = scores.masked_fill(~temporal_mask.unsqueeze(0), -torch.inf)
 
+    # Importance-based protection: penalise scores of high-importance src tokens
+    # so they are unlikely to be selected for absorption.
+    if protect_topk_ratio > 0:
+        importance = metric[:, src_indices].norm(dim=-1)  # [B, n_src]
+        n_protect = int(n_src * protect_topk_ratio)
+        if n_protect > 0:
+            _, protect_local = importance.topk(n_protect, dim=1)  # [B, n_protect]
+            penalty = torch.zeros_like(scores[:, :, 0])  # [B, n_src]
+            penalty.scatter_(1, protect_local, -1e9)
+            scores = scores + penalty.unsqueeze(2)
+
     best_dst_score, best_dst_local = scores.max(dim=2)  # [B, n_src]
     _, top_src_local = best_dst_score.topk(r, dim=1)  # [B, r]
 
     batch_src_idx = src_indices[top_src_local]  # [B, r]
     matched_dst_local = torch.gather(best_dst_local, 1, top_src_local)  # [B, r]
     batch_dst_idx = dst_indices[matched_dst_local]  # [B, r]
+
+    # CFG-consistent: force both batch elements to use the same merge pattern
+    if cfg_consistent and B == 2:
+        batch_src_idx = batch_src_idx[1:2].expand(B, -1)
+        batch_dst_idx = batch_dst_idx[1:2].expand(B, -1)
 
     removed = torch.zeros(B, N, dtype=torch.bool, device=metric.device)
     removed.scatter_(1, batch_src_idx, True)
@@ -369,6 +485,82 @@ def unmerge_tokens(
     )
     full_x.scatter_(1, info.src_idx.unsqueeze(-1).expand(-1, -1, C), dst_values)
 
+    return full_x
+
+
+def unmerge_tokens_interpolated(
+    merged_x: torch.Tensor,
+    info: RestoreInfo,
+) -> torch.Tensor:
+    """Interpolated unmerge: absorbed tokens get a blend of their dst value
+    and the mean of spatial neighbours in the kept set.
+
+    This reduces the "block copy" artifact of standard unmerge where src
+    positions are exact duplicates of their dst, producing grid patterns
+    after 40 denoising steps.
+
+    Args:
+        merged_x: [B, N-r, C]
+        info: RestoreInfo.
+
+    Returns:
+        full_x: [B, N, C]
+    """
+    B, _, C = merged_x.shape
+    N = info.num_video_tokens
+    r = info.src_idx.shape[1]
+
+    if r == 0:
+        return merged_x.clone()
+
+    # Start with standard copy-unmerge as the base
+    full_x = torch.zeros(B, N, C, device=merged_x.device, dtype=merged_x.dtype)
+    full_x.scatter_(1, info.keep_idx.unsqueeze(-1).expand(-1, -1, C), merged_x)
+
+    dst_in_keep = _find_positions_vectorized(info.keep_idx, info.dst_idx)
+    dst_values = torch.gather(
+        merged_x, 1, dst_in_keep.unsqueeze(-1).expand(-1, -1, C)
+    )
+
+    # Compute spatial-neighbour average for each src position.
+    # For each src token, find its 4-connected neighbours among kept tokens.
+    frames, gh, gw = info.grid
+    src_pos = info.src_idx  # [B, r]
+
+    src_t = src_pos // (gh * gw)
+    src_hw = src_pos % (gh * gw)
+    src_h = src_hw // gw
+    src_w = src_hw % gw
+
+    # Collect values from up to 4 spatial neighbours (same frame, ±1 in h or w)
+    offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    neighbour_sum = torch.zeros(B, r, C, device=merged_x.device, dtype=merged_x.dtype)
+    neighbour_count = torch.zeros(B, r, 1, device=merged_x.device, dtype=merged_x.dtype)
+
+    for dh, dw in offsets:
+        nh = src_h + dh
+        nw = src_w + dw
+        valid = (nh >= 0) & (nh < gh) & (nw >= 0) & (nw < gw)  # [B, r]
+        neighbour_flat = src_t * (gh * gw) + nh.clamp(0, gh - 1) * gw + nw.clamp(0, gw - 1)
+        # Gather from full_x (which has kept tokens placed already)
+        neighbour_vals = torch.gather(
+            full_x, 1, neighbour_flat.unsqueeze(-1).expand(-1, -1, C)
+        )
+        neighbour_sum += neighbour_vals * valid.unsqueeze(-1).float()
+        neighbour_count += valid.unsqueeze(-1).float()
+
+    # Blend: 70% dst value + 30% neighbour average (where neighbours exist)
+    has_neighbours = neighbour_count.squeeze(-1) > 0  # [B, r]
+    neighbour_avg = neighbour_sum / neighbour_count.clamp(min=1)
+
+    blend_weight = 0.3
+    blended = torch.where(
+        has_neighbours.unsqueeze(-1),
+        dst_values * (1 - blend_weight) + neighbour_avg * blend_weight,
+        dst_values,
+    )
+
+    full_x.scatter_(1, info.src_idx.unsqueeze(-1).expand(-1, -1, C), blended)
     return full_x
 
 

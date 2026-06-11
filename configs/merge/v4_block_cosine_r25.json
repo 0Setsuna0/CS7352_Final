@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "ratio": 0.25,
+  "mode": "spatial",
+  "scope": "block",
+  "rope_mode": "pre_rope",
+  "prop_attn": true,
+  "match_feature": "hidden_norm",
+  "layers": "middle_wide",
+  "temporal_window": 1,
+  "protect_first_frame": true,
+  "skip_early_ratio": 0.3,
+  "skip_late_ratio": 0.15,
+  "partition": "checkerboard_shifted",
+  "reuse_interval": 2,
+  "ratio_schedule": "cosine",
+  "layer_ratio_decay": 0.4,
+  "protect_topk_ratio": 0.2,
+  "cfg_consistent": true,
+  "unmerge_mode": "interpolate"
+}

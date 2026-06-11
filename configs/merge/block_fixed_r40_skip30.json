@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "ratio": 0.4,
+  "mode": "spatial",
+  "scope": "block",
+  "rope_mode": "pre_rope",
+  "prop_attn": false,
+  "match_feature": "fixed",
+  "layers": "middle_wide",
+  "temporal_window": 1,
+  "protect_first_frame": true,
+  "skip_early_ratio": 0.3
+}
