@@ -373,7 +373,8 @@ def bipartite_soft_match(
         if n_protect > 0:
             _, protect_local = importance.topk(n_protect, dim=1)  # [B, n_protect]
             penalty = torch.zeros_like(scores[:, :, 0])  # [B, n_src]
-            penalty.scatter_(1, protect_local, -1e9)
+            pen_val = torch.finfo(scores.dtype).min / 2
+            penalty.scatter_(1, protect_local, pen_val)
             scores = scores + penalty.unsqueeze(2)
 
     best_dst_score, best_dst_local = scores.max(dim=2)  # [B, n_src]
