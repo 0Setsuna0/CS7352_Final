@@ -1,0 +1,19 @@
+# low-motion background
+A quiet mountain lake at sunrise with mist drifting over the water, subtle ripples, realistic cinematic lighting.
+A cozy study room with curtains moving gently in the wind, dust motes in sunlight, warm detailed textures.
+
+# high-motion subject
+A skateboarder performs a fast kickflip on a city street, clothes fluttering, wheels spinning, dynamic camera motion.
+A red sports car splashes through a shallow puddle at night, reflections and water droplets moving rapidly.
+
+# camera motion
+A handheld camera pushes through a narrow lantern-lit alley, parallax on walls and signs, realistic motion blur.
+A drone camera circles an old stone lighthouse during a storm, waves crashing below, dramatic clouds.
+
+# fine details / human / animal
+A chef slices vegetables quickly on a wooden board, fingers and knife motion visible, steam rising in the kitchen.
+A golden retriever shakes water from its fur on a beach, droplets flying, detailed fur and natural motion.
+
+# multi-object interaction
+Two dancers spin around each other in a ballroom, fabric flowing, synchronized movement, polished floor reflections.
+A small robot hands a flower to a child in a park, both moving naturally, leaves swaying in the background.

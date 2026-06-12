@@ -1,0 +1,2 @@
+pair_id,prompt,baseline_video,candidate_video
+quality_rnr_panda_studio,"A panda wearing a simple red scarf sits on a plain wooden stool in a clean studio with a soft warm gray backdrop and plays an acoustic guitar.","outputs/quality_rnr/quality_baseline.mp4","outputs/quality_rnr/quality_rnr_on.mp4"

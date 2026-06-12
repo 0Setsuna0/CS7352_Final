@@ -1,0 +1,1 @@
+pair_id,prompt,baseline_video,candidate_video,num_frames_compared,frame_mse,frame_psnr,temporal_diff_baseline,temporal_diff_candidate,temporal_diff_delta

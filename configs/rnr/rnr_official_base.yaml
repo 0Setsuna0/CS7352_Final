@@ -1,0 +1,38 @@
+{
+  "method": "rnr_tome",
+  "model": "cogvideox-2b",
+  "encoder_first": true,
+  "similarity_type": "euclidean",
+  "reduce_mode": "replace",
+  "dst_stride": [2, 2, 2],
+  "partition_mode": "random_chunk",
+  "partition_seed": 123,
+  "matching_cache_steps": 5,
+  "schedule_file": "schedulers/euclidean_cogvideox-2b_cache5.safetensors",
+  "schedule_url": "https://raw.githubusercontent.com/wenhao728/AsymRnR/main/schedulers/euclidean_cogvideox-2b_cache5.safetensors",
+  "q_reduce_ratio": 0.40,
+  "kv_reduce_ratio": 0.20,
+  "h_reduce_ratio": 0.0,
+  "layers": "all",
+  "protect_first_frame": false,
+  "protect_topk_ratio": 0.0,
+  "cfg_consistent": true,
+  "prop_attn": false,
+  "schedule": {
+    "q": {
+      "6": 0.4,
+      "7": 0.8
+    },
+    "v": {
+      "8": 0.3
+    }
+  },
+  "block_skip": {
+    "first_n": 0,
+    "last_n": 0
+  },
+  "step_skip": {
+    "first_frac": 0.0,
+    "last_frac": 0.0
+  }
+}

@@ -1,0 +1,170 @@
+\documentclass{article}
+
+\usepackage[preprint]{neurips_2024}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{amsmath}
+
+\title{Revisiting Token Merging for CogVideoX: Asymmetric Reduction and Restoration for Training-free Video Generation Acceleration}
+
+\author{CS7352 Course Project Team}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We study training-free inference acceleration for CogVideoX-2B through visual Token Merging.
+Early block-level hidden-state merging reduces computation but introduces blur, grid artifacts, flicker, and structural distortion.
+We therefore implement a schedule-aware asymmetric reduction/restoration variant inspired by AsymRnR: visual Q and/or K/V tokens are reduced inside attention, Q outputs are restored to full visual length, and text tokens remain untouched.
+This report skeleton intentionally leaves unrun metrics as ``not run yet'' until benchmark scripts are executed.
+\end{abstract}
+
+\section{Introduction}
+Video diffusion transformers are expensive because attention is applied to long spatiotemporal token sequences.
+The project follows the original proposal: accelerate open-source video generation models, primarily CogVideoX-2B, using training-free spatial and spatiotemporal Token Merging.
+We retain inherited naive ToMe as a baseline and add attention-level asymmetric reduction/restoration to improve the quality-efficiency trade-off.
+
+\section{Related Work}
+\paragraph{Video diffusion transformers.}
+CogVideoX uses a transformer-based video generation architecture with joint text/video attention.
+
+\paragraph{Token Merging and ToMe.}
+ToMe performs bipartite matching to merge similar tokens and can reduce attention cost without training.
+Direct hidden-state merging, however, is risky in iterative video denoising.
+
+\paragraph{Diffusion acceleration.}
+Cache and distillation methods are important related work but are not the main implementation here.
+
+\paragraph{AsymRnR and token reduction.}
+AsymRnR motivates asymmetric token reduction and restoration in diffusion transformers.
+Our implementation is a project-owned AsymRnR-lite variant for CogVideoX attention processors.
+
+\section{Method}
+\subsection{Naive Frame-wise Spatial ToMe Baseline}
+The inherited baseline merges visual hidden states inside selected CogVideoX blocks and restores them after attention/FFN.
+It is preserved as \texttt{--accel naive\_tome}.
+
+\subsection{Problems with Hidden-state ToMe in Video DiT}
+Block-level merging removes independent representations for absorbed visual positions and can amplify artifacts over denoising steps.
+Observed artifacts include blur, pixelation, flicker, structure distortion, and motion instability.
+
+\subsection{Asymmetric Q/V Reduction-Restoration}
+The new method performs Q/K/V projection first, applies RoPE to full visual Q/K, reduces visual Q and/or K/V, runs SDPA, then restores Q-output to the original visual length.
+Text tokens are never reduced.
+
+\subsection{Spatiotemporal Bipartite Matching}
+Visual tokens are partitioned by a destination stride over latent time, height, and width.
+Source tokens are matched to destination tokens by cosine, dot, Euclidean, or random similarity.
+
+\subsection{Euclidean Matching and Replace Reduction}
+The default configuration uses Euclidean similarity and replace/discard reduction to avoid the extra averaging cost of mean reduction.
+Mean reduction is retained as an ablation.
+
+\subsection{Timestep, Block, and Feature Schedule}
+Q and K/V can use different ratios.
+Blocks are selected by layer strategy, and early/late denoising steps can be skipped.
+
+\subsection{Matching Cache}
+The runtime caches matching indices/plans by feature, block, shape, stride, ratio, and step window.
+The cache is reset per prompt and stores no hidden features.
+
+\section{Experiments}
+\subsection{Model and Setting}
+Model: CogVideoX-2B. Default formal setting: 49 frames, 480$\times$720, 50 denoising steps, seed 42.
+
+\subsection{Prompts}
+The benchmark prompt set is stored in \texttt{configs/prompts\_benchmark.txt}.
+
+\subsection{Metrics}
+Efficiency metrics: end-to-end latency, transformer latency, average denoising step time, peak GPU memory allocated/reserved, token reduction ratio, matching time, and cache hit rate.
+Quality metrics: lightweight frame MSE/PSNR against same-seed baseline, temporal difference proxy, and human pairwise review.
+FVD/VBench are not reported unless actually run.
+
+\subsection{Baselines}
+Baselines include no acceleration, inherited naive ToMe at multiple ratios, KV-only RnR, Q/V RnR, and final RnR-ToMe.
+
+\begin{table}[t]
+\centering
+\caption{Main latency-quality comparison.}
+\begin{tabular}{lrrrrr}
+\toprule
+Method & E2E s & Step s & Peak GiB & Quality metric & Status \\
+\midrule
+none & not run yet & not run yet & not run yet & not run yet & TODO \\
+naive\_tome r=0.2 & not run yet & not run yet & not run yet & not run yet & TODO \\
+kv\_rnr & not run yet & not run yet & not run yet & not run yet & TODO \\
+qv\_rnr & not run yet & not run yet & not run yet & not run yet & TODO \\
+rnr\_tome & not run yet & not run yet & not run yet & not run yet & TODO \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Ablation on similarity, reduction, and cache.}
+\begin{tabular}{llllr}
+\toprule
+Similarity & Reduction & Cache steps & Variant & Status \\
+\midrule
+cosine & replace & 5 & rnr\_tome & not run yet \\
+euclidean & replace & 5 & rnr\_tome & not run yet \\
+euclidean & mean & 5 & rnr\_tome & not run yet \\
+euclidean & replace & 1 & rnr\_tome & not run yet \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Prompt-category breakdown.}
+\begin{tabular}{lrrrr}
+\toprule
+Category & Prompt count & Best speedup & Quality note & Status \\
+\midrule
+low motion & 2 & not run yet & TODO & TODO \\
+high motion & 2 & not run yet & TODO & TODO \\
+camera motion & 2 & not run yet & TODO & TODO \\
+fine details & 2 & not run yet & TODO & TODO \\
+multi-object & 2 & not run yet & TODO & TODO \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Memory and token statistics.}
+\begin{tabular}{lrrrr}
+\toprule
+Method & Peak allocated GiB & Peak reserved GiB & Q reduction & KV reduction \\
+\midrule
+none & not run yet & not run yet & 0 & 0 \\
+kv\_rnr & not run yet & not run yet & not run yet & not run yet \\
+qv\_rnr & not run yet & not run yet & not run yet & not run yet \\
+rnr\_tome & not run yet & not run yet & not run yet & not run yet \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Qualitative Analysis}
+Manual inspection should focus on blur, pixelation, flicker, structure distortion, and motion artifacts.
+Pairwise review templates are generated by \texttt{scripts/evaluate\_quality.py}.
+
+\section{Limitations}
+The current RnR schedule is an AsymRnR-lite implementation with fixed ratios and explicit gates rather than a learned or pre-estimated similarity-threshold policy.
+Full-resolution CogVideoX-2B is memory intensive on 12 GiB GPUs.
+
+\section{Conclusion}
+This work reframes the inherited naive ToMe baseline into a reproducible comparison point and adds attention-level asymmetric reduction/restoration for safer training-free acceleration.
+
+\section{Contribution Statement}
+Existing naive ToMe code was inherited from preliminary project work.
+This implementation adds attention-level asymmetric RnR, scheduling, matching cache, unified benchmark scripts, evaluation scripts, audits, and report/result structure.
+AsymRnR, Diffusers, and CogVideoX were used as references, not copied wholesale.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

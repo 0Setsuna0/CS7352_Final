@@ -1,0 +1,24 @@
+{
+  "method": "rnr_tome",
+  "model": "cogvideox-2b",
+  "encoder_first": true,
+  "similarity_type": "euclidean",
+  "reduce_mode": "replace",
+  "dst_stride": [2, 2, 2],
+  "matching_cache_steps": 8,
+  "q_reduce_ratio": 0.65,
+  "kv_reduce_ratio": 0.40,
+  "layers": "all",
+  "protect_first_frame": true,
+  "protect_topk_ratio": 0.05,
+  "cfg_consistent": true,
+  "prop_attn": false,
+  "block_skip": {
+    "first_n": 0,
+    "last_n": 0
+  },
+  "step_skip": {
+    "first_frac": 0.0,
+    "last_frac": 0.0
+  }
+}

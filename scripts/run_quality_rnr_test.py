@@ -1,11 +1,13 @@
-r"""Standalone high-quality CogVideoX test with a single TokenMerge toggle.
+r"""Standalone high-quality CogVideoX test with a single RnR toggle.
 
 Normal usage:
-  1. Edit only ENABLE_TOKEN_MERGE below.
+  1. Edit ENABLE_TOKEN_MERGE, PROMPT_INDEX, and RNR_CONFIG_INDEX below.
   2. Run:
-       .\.venv\Scripts\python.exe .\scripts\run_quality_tokenmerge_test.py
+       .\.venv\Scripts\python.exe .\scripts\run_quality_rnr_test.py
 
-The script writes both the video and a JSON metadata file under outputs/.
+When ENABLE_TOKEN_MERGE is True, this script enables the new SA-RnR-ToMe
+attention-level reduction/restoration path. When False, it runs the original
+CogVideoX baseline.
 """
 from __future__ import annotations
 
@@ -22,12 +24,12 @@ from huggingface_hub import snapshot_download
 
 
 # User-facing switches.
-ENABLE_TOKEN_MERGE = True
-PROMPT_INDEX = 0
+ENABLE_TOKEN_MERGE = False
+PROMPT_INDEX = 7
+RNR_CONFIG_INDEX = 6
 
 
 _MODEL_ID = "THUDM/CogVideoX-2b"
-_TOKEN_MERGE_CONFIG = "configs/merge/toma_kv_spatial_r30_reuse4.json"
 _SEED = 123
 _HEIGHT = 480
 _WIDTH = 720
@@ -41,6 +43,41 @@ _DEVICE = "cuda"
 _DOWNLOAD_WORKERS = 1
 _LOCAL_FILES_ONLY = False
 
+RNR_CONFIG_PRESETS = [
+    {
+        "name": "quality_safe",
+        "path": "configs/rnr/rnr_quality_safe.yaml",
+    },
+    {
+        "name": "conservative",
+        "path": "configs/rnr/rnr_conservative.yaml",
+    },
+    {
+        "name": "balanced",
+        "path": "configs/rnr/rnr_balanced.yaml",
+    },
+    {
+        "name": "current_default",
+        "path": "configs/rnr/rnr_current_default.yaml",
+    },
+    {
+        "name": "aggressive",
+        "path": "configs/rnr/rnr_aggressive.yaml",
+    },
+    {
+        "name": "max_speed",
+        "path": "configs/rnr/rnr_max_speed.yaml",
+    },
+    {
+        "name": "official_base",
+        "path": "configs/rnr/rnr_official_base.yaml",
+    },
+    {
+        "name": "official_fast",
+        "path": "configs/rnr/rnr_official_fast.yaml",
+    },
+]
+
 QUALITY_PROMPTS = [
     {
         "name": "panda_studio_guitar",
@@ -50,15 +87,6 @@ QUALITY_PROMPTS = [
             "and the panda gently nods its head to the music. The camera makes a slow smooth push-in, with soft studio lighting, "
             "a clear centered subject, minimal background detail, stable motion, realistic fur, crisp guitar shape, natural colors, "
             "high quality video."
-        ),
-    },
-    {
-        "name": "robot_wave_studio",
-        "prompt": (
-            "A small friendly silver robot stands alone on a matte white floor against a smooth pale blue studio backdrop. "
-            "The robot slowly raises one arm and waves three times, then tilts its head with a gentle mechanical smile. "
-            "The camera stays centered with a slow dolly-in, soft even lighting, simple clean background, crisp metal edges, "
-            "stable motion, high quality video."
         ),
     },
     {
@@ -91,6 +119,15 @@ QUALITY_PROMPTS = [
             "A white paper airplane glides gently across an empty studio space with a smooth light blue backdrop and a pale floor. "
             "It enters from the left, floats in a shallow arc, and exits to the right while casting a faint moving shadow. "
             "The camera pans slowly to follow it, clean composition, minimal background, stable motion, high quality video."
+        ),
+    },
+    {
+        "name": "robot_wave_studio",
+        "prompt": (
+            "A small friendly silver robot stands alone on a matte white floor against a smooth pale blue studio backdrop. "
+            "The robot slowly raises one arm and waves three times, then tilts its head with a gentle mechanical smile. "
+            "The camera stays centered with a slow dolly-in, soft even lighting, simple clean background, crisp metal edges, "
+            "stable motion, high quality video."
         ),
     },
     {
@@ -138,6 +175,11 @@ QUALITY_PROMPTS = [
 _SELECTED_PROMPT = QUALITY_PROMPTS[PROMPT_INDEX] if 0 <= PROMPT_INDEX < len(QUALITY_PROMPTS) else None
 _PROMPT_NAME = _SELECTED_PROMPT["name"] if _SELECTED_PROMPT else "invalid_prompt"
 _PROMPT = _SELECTED_PROMPT["prompt"] if _SELECTED_PROMPT else ""
+_SELECTED_RNR_CONFIG = (
+    RNR_CONFIG_PRESETS[RNR_CONFIG_INDEX] if 0 <= RNR_CONFIG_INDEX < len(RNR_CONFIG_PRESETS) else None
+)
+_RNR_CONFIG_NAME = _SELECTED_RNR_CONFIG["name"] if _SELECTED_RNR_CONFIG else "invalid_config"
+_RNR_CONFIG = _SELECTED_RNR_CONFIG["path"] if _SELECTED_RNR_CONFIG else ""
 
 
 def repo_root() -> Path:
@@ -145,20 +187,26 @@ def repo_root() -> Path:
 
 
 def output_path() -> Path:
-    mode = "on" if ENABLE_TOKEN_MERGE else "off"
-    return repo_root() / "outputs" / "quality_tokenmerge" / f"quality_tokenmerge_{_PROMPT_NAME}_{mode}.mp4"
+    mode = "rnr_on" if ENABLE_TOKEN_MERGE else "baseline"
+    mode_suffix = f"{_RNR_CONFIG_NAME}_{mode}" if ENABLE_TOKEN_MERGE else mode
+    return repo_root() / "outputs" / "quality_rnr" / f"quality_{_PROMPT_NAME}_{mode_suffix}.mp4"
 
 
 def resolve_dtype(dtype_name: str) -> torch.dtype:
     return {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
     }[dtype_name]
 
 
 def validate_settings() -> None:
     if _SELECTED_PROMPT is None:
         raise ValueError(f"PROMPT_INDEX must be between 0 and {len(QUALITY_PROMPTS) - 1}, got {PROMPT_INDEX}.")
+    if _SELECTED_RNR_CONFIG is None:
+        raise ValueError(
+            f"RNR_CONFIG_INDEX must be between 0 and {len(RNR_CONFIG_PRESETS) - 1}, got {RNR_CONFIG_INDEX}."
+        )
 
     if _HEIGHT % 8 != 0 or _WIDTH % 8 != 0:
         raise ValueError("_HEIGHT and _WIDTH must both be divisible by 8.")
@@ -213,6 +261,12 @@ def peak_gpu_memory_gib() -> float | None:
     return torch.cuda.max_memory_allocated() / 1024**3
 
 
+def peak_gpu_reserved_gib() -> float | None:
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.max_memory_reserved() / 1024**3
+
+
 def resolve_model_snapshot() -> str:
     print("Resolving model snapshot...")
     print(f"  model_id={_MODEL_ID}")
@@ -224,23 +278,24 @@ def resolve_model_snapshot() -> str:
     )
 
 
-def attach_token_merge(pipe: CogVideoXPipeline):
+def attach_rnr(pipe: CogVideoXPipeline):
     if not ENABLE_TOKEN_MERGE:
-        return None
+        return None, None
 
     src_dir = repo_root() / "src"
     if str(src_dir) not in sys.path:
         sys.path.insert(0, str(src_dir))
 
-    from tokmerge.runtime import attach_merge_config, load_merge_config
+    from tokmerge.rnr import apply_rnr_to_cogvideox, load_rnr_config
 
-    config_path = repo_root() / _TOKEN_MERGE_CONFIG
+    config_path = repo_root() / _RNR_CONFIG
     if not config_path.exists():
-        raise FileNotFoundError(f"TokenMerge config not found: {config_path}")
+        raise FileNotFoundError(f"RnR config not found: {config_path}")
 
-    merge_cfg = load_merge_config(config_path)
-    attach_merge_config(pipe.transformer, merge_cfg)
-    return merge_cfg
+    rnr_cfg = load_rnr_config(config_path)
+    runtime = apply_rnr_to_cogvideox(pipe.transformer, rnr_cfg)
+    runtime.reset_prompt()
+    return rnr_cfg, runtime
 
 
 class TransformerTimingHooks:
@@ -299,14 +354,19 @@ def write_metadata(
     load_seconds: float,
     inference_seconds: float,
     timing_data: dict[str, float | None],
-    merge_cfg,
+    rnr_cfg,
+    rnr_runtime,
     actual_num_frames: int,
 ) -> Path:
+    rnr_stats = rnr_runtime.stats_dict() if rnr_runtime is not None else None
     metadata = {
         "model_id": _MODEL_ID,
         "prompt_index": PROMPT_INDEX,
         "prompt_name": _PROMPT_NAME,
         "prompt": _PROMPT,
+        "rnr_config_index": RNR_CONFIG_INDEX,
+        "rnr_config_name": _RNR_CONFIG_NAME,
+        "selected_rnr_config": str((repo_root() / _RNR_CONFIG).resolve()),
         "seed": _SEED,
         "height": _HEIGHT,
         "width": _WIDTH,
@@ -325,16 +385,18 @@ def write_metadata(
         "transformer_seconds": timing_data["transformer_seconds"],
         "avg_step_seconds": timing_data["avg_step_seconds"],
         "first_step_seconds": timing_data["first_step_seconds"],
-        "merge_enabled": merge_cfg.enabled if merge_cfg else False,
-        "merge_config": str((repo_root() / _TOKEN_MERGE_CONFIG).resolve()) if merge_cfg else None,
-        "merge_scope": merge_cfg.scope if merge_cfg else None,
-        "merge_ratio": merge_cfg.ratio if merge_cfg else None,
-        "merge_mode": merge_cfg.mode if merge_cfg else None,
-        "rope_mode": merge_cfg.rope_mode if merge_cfg else None,
-        "prop_attn": merge_cfg.prop_attn if merge_cfg else None,
-        "partition": merge_cfg.partition if merge_cfg else None,
-        "reuse_interval": merge_cfg.reuse_interval if merge_cfg else None,
+        "rnr_enabled": rnr_cfg is not None,
+        "rnr_config": str((repo_root() / _RNR_CONFIG).resolve()) if rnr_cfg else None,
+        "rnr_method": rnr_cfg.method if rnr_cfg else None,
+        "q_reduce_ratio": rnr_cfg.q_reduce_ratio if rnr_cfg else None,
+        "kv_reduce_ratio": rnr_cfg.kv_reduce_ratio if rnr_cfg else None,
+        "similarity_type": rnr_cfg.similarity_type if rnr_cfg else None,
+        "reduce_mode": rnr_cfg.reduce_mode if rnr_cfg else None,
+        "dst_stride": list(rnr_cfg.dst_stride) if rnr_cfg else None,
+        "matching_cache_steps": rnr_cfg.matching_cache_steps if rnr_cfg else None,
+        "rnr_stats": rnr_stats,
         "peak_gpu_memory_gib": None if peak_gpu_memory_gib() is None else round(peak_gpu_memory_gib(), 3),
+        "peak_gpu_reserved_gib": None if peak_gpu_reserved_gib() is None else round(peak_gpu_reserved_gib(), 3),
         "output_path": str(path.resolve()),
     }
 
@@ -348,13 +410,18 @@ def print_summary(video_path: Path, metadata_path: Path, timing_data: dict[str, 
     print("\nGeneration completed.")
     print(f"  video={video_path.resolve()}")
     print(f"  metadata={metadata_path.resolve()}")
-    print(f"  merge_enabled={metadata['merge_enabled']}")
+    print(f"  rnr_enabled={metadata['rnr_enabled']}")
     print(f"  inference_seconds={metadata['inference_seconds']}")
     if timing_data["transformer_seconds"] is not None:
         print(f"  transformer_seconds={timing_data['transformer_seconds']}")
         print(f"  avg_step_seconds={timing_data['avg_step_seconds']}")
         print(f"  first_step_seconds={timing_data['first_step_seconds']}")
     print(f"  peak_gpu_memory_gib={metadata['peak_gpu_memory_gib']}")
+    if metadata["rnr_stats"] is not None:
+        stats = metadata["rnr_stats"]
+        print(f"  rnr_cache_hit_rate={stats['cache_hit_rate']}")
+        print(f"  q_reduction_ratio={stats['q_reduction_ratio']}")
+        print(f"  kv_reduction_ratio={stats['kv_reduction_ratio']}")
 
 
 def main() -> int:
@@ -366,11 +433,13 @@ def main() -> int:
     video_path = output_path()
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("=== High-quality CogVideoX TokenMerge test ===")
+    print("=== High-quality CogVideoX RnR test ===")
     print(f"  repo={repo_root()}")
-    print(f"  token_merge={ENABLE_TOKEN_MERGE}")
+    print(f"  rnr_enabled={ENABLE_TOKEN_MERGE}")
     print(f"  prompt_index={PROMPT_INDEX}")
     print(f"  prompt_name={_PROMPT_NAME}")
+    print(f"  rnr_config_index={RNR_CONFIG_INDEX}")
+    print(f"  rnr_config_name={_RNR_CONFIG_NAME}")
     print(f"  size={_WIDTH}x{_HEIGHT}")
     print(f"  frames={_NUM_FRAMES}")
     print(f"  steps={_NUM_INFERENCE_STEPS}")
@@ -390,13 +459,12 @@ def main() -> int:
     load_seconds = time.perf_counter() - load_start
 
     use_dynamic_cfg = configure_pipeline(pipe)
-    merge_cfg = attach_token_merge(pipe)
-    if merge_cfg:
-        print(f"  merge_config={(repo_root() / _TOKEN_MERGE_CONFIG).resolve()}")
-        print(f"  merge_scope={merge_cfg.scope}, ratio={merge_cfg.ratio}, mode={merge_cfg.mode}")
-        print(f"  partition={merge_cfg.partition}")
-        print(f"  reuse_interval={merge_cfg.reuse_interval}")
-        print(f"  merge_layers={merge_cfg.layers}")
+    rnr_cfg, rnr_runtime = attach_rnr(pipe)
+    if rnr_cfg:
+        print(f"  rnr_config={(repo_root() / _RNR_CONFIG).resolve()}")
+        print(f"  method={rnr_cfg.method}, q_ratio={rnr_cfg.q_reduce_ratio}, kv_ratio={rnr_cfg.kv_reduce_ratio}")
+        print(f"  similarity={rnr_cfg.similarity_type}, reduce_mode={rnr_cfg.reduce_mode}")
+        print(f"  dst_stride={rnr_cfg.dst_stride}, cache_steps={rnr_cfg.matching_cache_steps}")
 
     generator = torch.Generator().manual_seed(_SEED)
     timing_hooks = TransformerTimingHooks()
@@ -430,7 +498,8 @@ def main() -> int:
         load_seconds=load_seconds,
         inference_seconds=inference_seconds,
         timing_data=timing_data,
-        merge_cfg=merge_cfg,
+        rnr_cfg=rnr_cfg,
+        rnr_runtime=rnr_runtime,
         actual_num_frames=len(frames),
     )
     print_summary(video_path, metadata_path, timing_data)

@@ -34,6 +34,7 @@ from tokmerge.merging import (
     compute_layer_ratio,
     RestoreInfo as _RestoreInfo,
 )
+from tokmerge.rnr.partition import VisualLayout as _RNRVisualLayout
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import PeftAdapterMixin
@@ -144,10 +145,12 @@ class CogVideoXBlock(nn.Module):
         attention_kwargs = attention_kwargs or {}
 
         merge_cfg = getattr(self, "_merge_cfg", None)
+        rnr_runtime = getattr(self, "_rnr_runtime", None)
         merge_active = (
             merge_cfg is not None
             and merge_cfg.enabled
             and merge_cfg.ratio > 0
+            and rnr_runtime is None
             and hasattr(self, "_block_index")
             and self._block_index in merge_cfg.layers
             and "_tokmerge_grid" in attention_kwargs
@@ -159,142 +162,161 @@ class CogVideoXBlock(nn.Module):
         )
 
         if merge_active:
-            grid_t, grid_h, grid_w = attention_kwargs["_tokmerge_grid"]
-            N_video = norm_hidden_states.shape[1]
+                grid_t, grid_h, grid_w = attention_kwargs["_tokmerge_grid"]
+                N_video = norm_hidden_states.shape[1]
 
-            # Use timestep-scheduled ratio from transformer forward, then apply layer decay
-            effective_ratio = attention_kwargs.get("_tokmerge_effective_ratio", merge_cfg.ratio)
-            layer_decay = getattr(merge_cfg, "layer_ratio_decay", 0.0)
-            if layer_decay > 0:
-                effective_ratio = compute_layer_ratio(
-                    effective_ratio, self._block_index, merge_cfg.layers, layer_decay
-                )
-
-            r = int(N_video * effective_ratio)
-            partition = getattr(merge_cfg, "partition", "checkerboard")
-            partition_offset = getattr(self, "_block_index", 0)
-            reuse_interval = max(1, int(getattr(merge_cfg, "reuse_interval", 1)))
-            call_idx = getattr(self, "_tokmerge_call_idx", 0)
-            self._tokmerge_call_idx = call_idx + 1
-            cache_key = (
-                norm_hidden_states.shape[0],
-                N_video,
-                r,
-                grid_t,
-                grid_h,
-                grid_w,
-                merge_cfg.mode,
-                merge_cfg.temporal_window,
-                merge_cfg.protect_first_frame,
-                merge_cfg.match_feature,
-                partition,
-                partition_offset % 2,
-                str(norm_hidden_states.device),
-            )
-            cached_info = getattr(self, "_tokmerge_cached_info", None)
-            cached_key = getattr(self, "_tokmerge_cached_key", None)
-            should_reuse = (
-                reuse_interval > 1
-                and cached_info is not None
-                and cached_key == cache_key
-                and call_idx % reuse_interval != 0
-            )
-
-            if should_reuse:
-                info = cached_info
-            else:
-                if merge_cfg.match_feature == "fixed":
-                    metric = norm_hidden_states[:, :, :1]
-                else:
-                    metric = torch.nn.functional.normalize(norm_hidden_states, dim=-1)
-                src_idx, dst_idx, keep_idx, sizes = _bsm(
-                    metric, r, grid_t, grid_h, grid_w,
-                    mode=merge_cfg.mode,
-                    temporal_window=merge_cfg.temporal_window,
-                    protect_first_frame=merge_cfg.protect_first_frame,
-                    match_feature=merge_cfg.match_feature,
-                    partition=partition,
-                    partition_offset=partition_offset,
-                    protect_topk_ratio=getattr(merge_cfg, "protect_topk_ratio", 0.0),
-                    cfg_consistent=getattr(merge_cfg, "cfg_consistent", False),
-                )
-                info = _RestoreInfo(
-                    src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
-                    sizes=sizes, num_video_tokens=N_video,
-                    grid=(grid_t, grid_h, grid_w),
-                )
-                if reuse_interval > 1:
-                    self._tokmerge_cached_info = info
-                    self._tokmerge_cached_key = cache_key
-
-            clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
-
-            _do_interp = getattr(merge_cfg, "unmerge_mode", "copy") == "interpolate"
-            _unmerge_fn = _unmerge_interp if _do_interp else _unmerge
-
-            if merge_cfg.scope == "pre_attn_restore":
-                merged_video, new_sizes = _merge(norm_hidden_states, info)
-                info = _RestoreInfo(
-                    src_idx=info.src_idx, dst_idx=info.dst_idx,
-                    keep_idx=info.keep_idx, sizes=new_sizes,
-                    num_video_tokens=N_video, grid=info.grid,
-                )
-                attn_hidden_states, attn_encoder_hidden_states = self.attn1(
-                    hidden_states=merged_video,
-                    encoder_hidden_states=norm_encoder_hidden_states,
-                    image_rotary_emb=image_rotary_emb,
-                    **clean_kwargs,
-                )
-                attn_hidden_states = _unmerge_fn(attn_hidden_states, info)
-
-            elif merge_cfg.scope == "kv_only":
-                # KV-only keeps every query/output position alive and only
-                # shortens video K/V inside the attention processor.
-                processor = self.attn1.processor
-                processor._tokmerge_info = info
-                processor._tokmerge_cfg = merge_cfg
-                try:
-                    attn_hidden_states, attn_encoder_hidden_states = self.attn1(
-                        hidden_states=norm_hidden_states,
-                        encoder_hidden_states=norm_encoder_hidden_states,
-                        image_rotary_emb=image_rotary_emb,
-                        **clean_kwargs,
+                # Use timestep-scheduled ratio from transformer forward, then apply layer decay
+                effective_ratio = attention_kwargs.get("_tokmerge_effective_ratio", merge_cfg.ratio)
+                layer_decay = getattr(merge_cfg, "layer_ratio_decay", 0.0)
+                if layer_decay > 0:
+                    effective_ratio = compute_layer_ratio(
+                        effective_ratio, self._block_index, merge_cfg.layers, layer_decay
                     )
-                finally:
-                    processor._tokmerge_info = None
-                    processor._tokmerge_cfg = None
 
-            elif merge_cfg.scope in ("attn_only", "block"):
-                if merge_cfg.scope == "block":
+                r = int(N_video * effective_ratio)
+                partition = getattr(merge_cfg, "partition", "checkerboard")
+                partition_offset = getattr(self, "_block_index", 0)
+                reuse_interval = max(1, int(getattr(merge_cfg, "reuse_interval", 1)))
+                call_idx = getattr(self, "_tokmerge_call_idx", 0)
+                self._tokmerge_call_idx = call_idx + 1
+                cache_key = (
+                    norm_hidden_states.shape[0],
+                    N_video,
+                    r,
+                    grid_t,
+                    grid_h,
+                    grid_w,
+                    merge_cfg.mode,
+                    merge_cfg.temporal_window,
+                    merge_cfg.protect_first_frame,
+                    merge_cfg.match_feature,
+                    partition,
+                    partition_offset % 2,
+                    str(norm_hidden_states.device),
+                )
+                cached_info = getattr(self, "_tokmerge_cached_info", None)
+                cached_key = getattr(self, "_tokmerge_cached_key", None)
+                should_reuse = (
+                    reuse_interval > 1
+                    and cached_info is not None
+                    and cached_key == cache_key
+                    and call_idx % reuse_interval != 0
+                )
+
+                if should_reuse:
+                    info = cached_info
+                else:
+                    if merge_cfg.match_feature == "fixed":
+                        metric = norm_hidden_states[:, :, :1]
+                    else:
+                        metric = torch.nn.functional.normalize(norm_hidden_states, dim=-1)
+                    src_idx, dst_idx, keep_idx, sizes = _bsm(
+                        metric, r, grid_t, grid_h, grid_w,
+                        mode=merge_cfg.mode,
+                        temporal_window=merge_cfg.temporal_window,
+                        protect_first_frame=merge_cfg.protect_first_frame,
+                        match_feature=merge_cfg.match_feature,
+                        partition=partition,
+                        partition_offset=partition_offset,
+                        protect_topk_ratio=getattr(merge_cfg, "protect_topk_ratio", 0.0),
+                        cfg_consistent=getattr(merge_cfg, "cfg_consistent", False),
+                    )
+                    info = _RestoreInfo(
+                        src_idx=src_idx, dst_idx=dst_idx, keep_idx=keep_idx,
+                        sizes=sizes, num_video_tokens=N_video,
+                        grid=(grid_t, grid_h, grid_w),
+                    )
+                    if reuse_interval > 1:
+                        self._tokmerge_cached_info = info
+                        self._tokmerge_cached_key = cache_key
+
+                clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+
+                _do_interp = getattr(merge_cfg, "unmerge_mode", "copy") == "interpolate"
+                _unmerge_fn = _unmerge_interp if _do_interp else _unmerge
+
+                if merge_cfg.scope == "pre_attn_restore":
                     merged_video, new_sizes = _merge(norm_hidden_states, info)
                     info = _RestoreInfo(
                         src_idx=info.src_idx, dst_idx=info.dst_idx,
                         keep_idx=info.keep_idx, sizes=new_sizes,
                         num_video_tokens=N_video, grid=info.grid,
                     )
-                    video_for_attn = merged_video
-                else:
-                    video_for_attn = norm_hidden_states
-
-                # Set merge info on processor so it can handle RoPE + prop_attn
-                processor = self.attn1.processor
-                processor._tokmerge_info = info
-                processor._tokmerge_cfg = merge_cfg
-                try:
                     attn_hidden_states, attn_encoder_hidden_states = self.attn1(
-                        hidden_states=video_for_attn,
+                        hidden_states=merged_video,
                         encoder_hidden_states=norm_encoder_hidden_states,
                         image_rotary_emb=image_rotary_emb,
                         **clean_kwargs,
                     )
-                finally:
-                    processor._tokmerge_info = None
-                    processor._tokmerge_cfg = None
-
-                if merge_cfg.scope == "block":
                     attn_hidden_states = _unmerge_fn(attn_hidden_states, info)
-            else:
-                raise ValueError(f"Unknown merge scope: {merge_cfg.scope}")
+
+                elif merge_cfg.scope == "kv_only":
+                    # KV-only keeps every query/output position alive and only
+                    # shortens video K/V inside the attention processor.
+                    processor = self.attn1.processor
+                    processor._tokmerge_info = info
+                    processor._tokmerge_cfg = merge_cfg
+                    try:
+                        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                            hidden_states=norm_hidden_states,
+                            encoder_hidden_states=norm_encoder_hidden_states,
+                            image_rotary_emb=image_rotary_emb,
+                            **clean_kwargs,
+                        )
+                    finally:
+                        processor._tokmerge_info = None
+                        processor._tokmerge_cfg = None
+
+                elif merge_cfg.scope in ("attn_only", "block"):
+                    if merge_cfg.scope == "block":
+                        merged_video, new_sizes = _merge(norm_hidden_states, info)
+                        info = _RestoreInfo(
+                            src_idx=info.src_idx, dst_idx=info.dst_idx,
+                            keep_idx=info.keep_idx, sizes=new_sizes,
+                            num_video_tokens=N_video, grid=info.grid,
+                        )
+                        video_for_attn = merged_video
+                    else:
+                        video_for_attn = norm_hidden_states
+
+                    # Set merge info on processor so it can handle RoPE + prop_attn
+                    processor = self.attn1.processor
+                    processor._tokmerge_info = info
+                    processor._tokmerge_cfg = merge_cfg
+                    try:
+                        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                            hidden_states=video_for_attn,
+                            encoder_hidden_states=norm_encoder_hidden_states,
+                            image_rotary_emb=image_rotary_emb,
+                            **clean_kwargs,
+                        )
+                    finally:
+                        processor._tokmerge_info = None
+                        processor._tokmerge_cfg = None
+
+                    if merge_cfg.scope == "block":
+                        attn_hidden_states = _unmerge_fn(attn_hidden_states, info)
+                else:
+                    raise ValueError(f"Unknown merge scope: {merge_cfg.scope}")
+        elif (
+            getattr(self, "_rnr_runtime", None) is not None
+            and hasattr(self, "_rnr_block_index")
+            and self._rnr_runtime.block_enabled(self._rnr_block_index)
+        ):
+            clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
+            processor = self.attn1.processor
+            processor._rnr_runtime = self._rnr_runtime
+            processor._rnr_block_index = self._rnr_block_index
+            try:
+                attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                    hidden_states=norm_hidden_states,
+                    encoder_hidden_states=norm_encoder_hidden_states,
+                    image_rotary_emb=image_rotary_emb,
+                    **clean_kwargs,
+                )
+            finally:
+                processor._rnr_runtime = None
+                processor._rnr_block_index = None
         else:
             # Baseline path: unchanged; filter out tokmerge keys
             clean_kwargs = {k: v for k, v in attention_kwargs.items() if not k.startswith("_tokmerge")}
@@ -650,6 +672,18 @@ class CogVideoXTransformer3DModel(ModelMixin, AttentionMixin, ConfigMixin, PeftA
                     "_tokmerge_grid": (grid_t, grid_h, grid_w),
                     "_tokmerge_effective_ratio": effective_ratio,
                 }
+
+        rnr_runtime = getattr(self, "_rnr_runtime", None)
+        if rnr_runtime is not None and rnr_runtime.enabled:
+            p = self.config.patch_size
+            p_t = self.config.patch_size_t
+            grid_h = height // p
+            grid_w = width // p
+            if p_t is None:
+                grid_t = num_frames
+            else:
+                grid_t = (num_frames + p_t - 1) // p_t
+            rnr_runtime.observe_transformer_call(timesteps, _RNRVisualLayout(grid_t, grid_h, grid_w))
 
         # 3. Transformer blocks
         for i, block in enumerate(self.transformer_blocks):
