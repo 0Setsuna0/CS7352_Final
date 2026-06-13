@@ -24,7 +24,7 @@ from huggingface_hub import snapshot_download
 
 
 # User-facing switches.
-ENABLE_TOKEN_MERGE = False
+ENABLE_TOKEN_MERGE = True
 PROMPT_INDEX = 7
 RNR_CONFIG_INDEX = 6
 
@@ -90,6 +90,15 @@ QUALITY_PROMPTS = [
         ),
     },
     {
+        "name": "robot_wave_studio",
+        "prompt": (
+            "A small friendly silver robot stands alone on a matte white floor against a smooth pale blue studio backdrop. "
+            "The robot slowly raises one arm and waves three times, then tilts its head with a gentle mechanical smile. "
+            "The camera stays centered with a slow dolly-in, soft even lighting, simple clean background, crisp metal edges, "
+            "stable motion, high quality video."
+        ),
+    },
+    {
         "name": "ceramic_cup_steam",
         "prompt": (
             "A white ceramic cup sits on a plain dark wooden table against a smooth warm gray wall. Thin steam rises from the cup "
@@ -119,15 +128,6 @@ QUALITY_PROMPTS = [
             "A white paper airplane glides gently across an empty studio space with a smooth light blue backdrop and a pale floor. "
             "It enters from the left, floats in a shallow arc, and exits to the right while casting a faint moving shadow. "
             "The camera pans slowly to follow it, clean composition, minimal background, stable motion, high quality video."
-        ),
-    },
-    {
-        "name": "robot_wave_studio",
-        "prompt": (
-            "A small friendly silver robot stands alone on a matte white floor against a smooth pale blue studio backdrop. "
-            "The robot slowly raises one arm and waves three times, then tilts its head with a gentle mechanical smile. "
-            "The camera stays centered with a slow dolly-in, soft even lighting, simple clean background, crisp metal edges, "
-            "stable motion, high quality video."
         ),
     },
     {

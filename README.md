@@ -4,6 +4,8 @@ This repository is a CS7352 course project on training-free inference accelerati
 
 The project keeps the inherited naive frame-wise hidden-state ToMe implementation as a baseline, then adds an AsymRnR-style attention-level method: visual Q and/or K/V tokens are reduced inside attention, Q outputs are restored to the original visual length, text tokens are never reduced, and block input/output shapes stay unchanged.
 
+For the current implementation status, successful configs, known pitfalls, and agent handoff notes, start with [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md).
+
 ## Relation to the Proposal
 
 The original proposal promised training-free spatial Token Merging for video generation using bipartite matching over visual tokens. Early code proved that hidden-state/full-block merging can speed up CogVideoX, but the generated videos showed blur, grid texture, flicker, and structure distortion. The current main method therefore moves from naive block-level ToMe to schedule-aware asymmetric reduction/restoration while staying within the Token Merging/Token Reduction theme.
@@ -67,19 +69,21 @@ bash scripts/smoke_test.sh
 
 ## Single-switch Quality Test
 
-For a high-quality panda/guitar prompt matching the earlier quality script, use:
+For a high-quality baseline/RnR pair, use:
 
 ```powershell
 python .\scripts\run_quality_rnr_test.py
 ```
 
-Edit only this line inside the script:
+Edit these variables inside the script:
 
 ```python
-ENABLE_TOKEN_MERGE = True
+ENABLE_TOKEN_MERGE = True   # True enables RnR, False runs baseline
+PROMPT_INDEX = 7            # e.g. lantern_boat_river
+RNR_CONFIG_INDEX = 6        # official_base, recommended
 ```
 
-`True` enables the new SA-RnR-ToMe attention-level path. `False` runs the original CogVideoX baseline with the same prompt, seed, resolution, frame count, and scheduler settings.
+`RNR_CONFIG_INDEX = 7` selects `official_fast`, which is faster but riskier for quality.
 
 ## Benchmark
 
@@ -115,11 +119,7 @@ python .\scripts\run_cogvideox_accel.py `
   --num_frames 49 `
   --height 480 `
   --width 720 `
-  --similarity_type euclidean `
-  --reduce_mode replace `
-  --dst_stride 2 2 2 `
-  --matching_cache_steps 5 `
-  --schedule_config configs/rnr_cogvideox2b_default.yaml `
+  --schedule_config configs/rnr/rnr_official_base.yaml `
   --log_latency `
   --log_memory `
   --save_video `
@@ -166,8 +166,9 @@ The lightweight evaluator computes frame MSE/PSNR and temporal difference proxie
 - `scripts/run_cogvideox_accel.py`: unified inference/benchmark CLI.
 - `scripts/evaluate_quality.py`: lightweight quality comparison.
 - `configs/merge/`: old naive/ToMA-like JSON configs.
-- `configs/rnr_cogvideox2b_default.yaml`: default RnR config.
-- `docs/code_audit.md` and `docs/source_audit.md`: required audits.
+- `configs/rnr/`: RnR presets, including official-base and official-fast schedules.
+- `docs/AGENT_HANDOFF.md`: current handoff for teammates and future agents.
+- `docs/source_audit.md`: external source audit and remaining deviations.
 - `report/main.tex`: NeurIPS-style report skeleton.
 - `results/`: reproducible result templates and generated benchmark outputs.
 
@@ -177,10 +178,10 @@ Edit `configs/prompts_benchmark.txt`. Blank lines and lines beginning with `#` a
 
 ## Modify Config
 
-For RnR, edit `configs/rnr_cogvideox2b_default.yaml` or override from CLI:
+For RnR, prefer `configs/rnr/rnr_official_base.yaml` or `configs/rnr/rnr_official_fast.yaml`. Fixed-ratio fallback configs are also under `configs/rnr/`.
 
 ```powershell
-python .\scripts\run_cogvideox_accel.py --accel rnr_tome --q_reduce_ratio 0.3 --kv_reduce_ratio 0.15
+python .\scripts\run_cogvideox_accel.py --accel rnr_tome --schedule_config configs/rnr/rnr_official_base.yaml
 ```
 
 For inherited naive ToMe, old JSON configs remain in `configs/merge/`.
@@ -189,12 +190,12 @@ For inherited naive ToMe, old JSON configs remain in `configs/merge/`.
 
 - Full-resolution CogVideoX-2B can exceed 12 GiB VRAM. Use CPU offload for smoke tests or a larger GPU for formal benchmarks.
 - Naive full-block ToMe can create blur, pixelation, flicker, structure distortion, and motion instability.
-- RnR quality and speed numbers are not reported until the new benchmark commands are actually run.
+- Prefer official-schedule RnR over fixed-ratio RnR for complex scenes.
 - Proportional attention bias can disable faster SDPA kernels; the default RnR config keeps `prop_attn=false`.
 
 ## Results Policy
 
-Do not write unrun numbers into the report. Existing historical results are documented in `docs/work_summary.md`; new `rnr_tome` results should be filled into `results/benchmark.csv`, `results/quality_metrics.csv`, and `report/main.tex` only after running the scripts.
+Do not write unrun numbers into the report. Current verified numbers are summarized in `docs/AGENT_HANDOFF.md`; future results should be copied from script output or per-run JSON metadata.
 
 ## References
 

@@ -1,6 +1,6 @@
 # Source Audit for SA-RnR-ToMe
 
-This file records the external sources checked while implementing `dev_plan_v5`. The implementation uses these sources as references for method design and API compatibility; it does not copy the AsymRnR repository wholesale.
+This file records the external sources checked while implementing the local CogVideoX RnR acceleration path. The implementation uses these sources as references for method design and API compatibility; it does not copy the AsymRnR repository wholesale.
 
 ## AsymRnR paper
 
@@ -32,15 +32,15 @@ This file records the external sources checked while implementing `dev_plan_v5`.
 
 ## Existing local project documents
 
-- `docs/tokenmerge_optimization_plan.md`: documents the quality problems of hidden-state/full-block merge and motivates KV-only and attention-level methods.
-- `docs/work_summary.md`: records existing TokenMerge implementation details, real historical speed numbers, and known pitfalls.
-- `docs/cogvideox_source_map.md`: identifies the vendored diffusers files used by the actual runtime.
+- `docs/AGENT_HANDOFF.md`: current handoff for future teammates/agents, including implementation status, run commands, successful results, and pitfalls.
+- `docs/source_audit.md`: this external-source audit and remaining deviations from upstream AsymRnR.
+- `docs/github_setup.md`: repository collaboration notes.
 
 ## Boundary of this implementation
 
 - This is not TeaCache, DeepCache, TaylorCache, LCM, DMD, or pure sparse attention.
 - It remains a training-free Token Merging/Token Reduction project.
-- New RnR scripts and report templates contain no invented benchmark or quality numbers. New result cells remain `not run yet` until commands are executed.
+- Report/result documents should only include numbers copied from script output or per-run JSON metadata. Do not invent benchmark or quality numbers.
 
 ## Comparison with upstream AsymRnR code
 
@@ -72,6 +72,17 @@ The local RnR path was updated to align more closely with the official CogVideoX
 - Added optional hidden-state (`h`) reduction/restoration plumbing, disabled by default for CogVideoX-2B quality configs because the official CogVideoX config only enables `q` and `v`.
 - Added `configs/rnr/rnr_official_base.yaml` and `configs/rnr/rnr_official_fast.yaml`.
 - Verified an actual tiny CogVideoX run with `configs/rnr/rnr_official_base.yaml`; metadata showed `schedule_loaded=true` and dynamic average reduction ratios rather than fixed global ratios.
+
+## Deprecated local routes
+
+Earlier local experiments produced useful negative results:
+
+- Full-block hidden-state TokenMerge is useful as a `naive_tome` baseline, but not as the final method because it creates blur, grid texture, structure distortion, flicker, and motion instability.
+- Fixed-ratio RnR was faster on simple prompts, but less stable on fine details and complex scenes than the official redundancy schedule.
+- Deterministic strided destinations were replaced by official-style random spatiotemporal chunk destinations.
+- Broadcast Euclidean distance was removed after causing extreme memory allocation; the local implementation now uses a matrix-distance formulation.
+- Generic negative prompts were removed from quality scripts because they interfered with subject preservation and valid static-object prompts.
+- `prop_attn=true` remains off by default because it can disable faster SDPA kernels in this environment.
 
 Remaining known deviations from upstream:
 
